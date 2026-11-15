@@ -1,0 +1,207 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 0: Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Pillar 3: Strict document ID validation (prevents ID poisoning & path traversal)
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Verified Firebase Auth session required for all cloud reads/writes
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Pillar 2 & 5: Strict bounded validation for serialized track metadata
+    function isValidSongMap(s) {
+      return s is map
+        && s.keys().hasAll(['id', 'name'])
+        && s.keys().hasOnly(['id', 'name', 'duration', 'year', 'language', 'album', 'artists', 'image', 'downloadUrl'])
+        && isValidId(s.id)
+        && s.name is string && s.name.size() >= 1 && s.name.size() <= 300
+        && (!('duration' in s) || (s.duration is number && s.duration >= 0 && s.duration <= 86400))
+        && (!('year' in s) || (s.year is string && s.year.size() <= 20))
+        && (!('language' in s) || (s.language is string && s.language.size() <= 40))
+        && (!('album' in s) || (
+          s.album is map
+          && s.album.keys().hasOnly(['id', 'name'])
+          && (!('id' in s.album) || (s.album.id is string && s.album.id.size() <= 128))
+          && (!('name' in s.album) || (s.album.name is string && s.album.name.size() <= 200))
+        ))
+        && (!('artists' in s) || (
+          s.artists is map
+          && s.artists.keys().hasOnly(['primary'])
+          && (!('primary' in s.artists) || (
+            s.artists.primary is list
+            && s.artists.primary.size() <= 10
+            && (s.artists.primary.size() == 0 || (
+              s.artists.primary[0] is map
+              && s.artists.primary[0].keys().hasOnly(['id', 'name'])
+              && (!('id' in s.artists.primary[0]) || (s.artists.primary[0].id is string && s.artists.primary[0].id.size() <= 128))
+              && (!('name' in s.artists.primary[0]) || (s.artists.primary[0].name is string && s.artists.primary[0].name.size() <= 120))
+            ))
+          ))
+        ))
+        && (!('image' in s) || (
+          s.image is list
+          && s.image.size() <= 6
+          && (s.image.size() == 0 || (
+            s.image[0] is map
+            && s.image[0].keys().hasOnly(['quality', 'url'])
+            && (!('quality' in s.image[0]) || (s.image[0].quality is string && s.image[0].quality.size() <= 32))
+            && (!('url' in s.image[0]) || (s.image[0].url is string && s.image[0].url.size() <= 512))
+          ))
+        ))
+        && (!('downloadUrl' in s) || (
+          s.downloadUrl is list
+          && s.downloadUrl.size() <= 8
+          && (s.downloadUrl.size() == 0 || (
+            s.downloadUrl[0] is map
+            && s.downloadUrl[0].keys().hasOnly(['quality', 'url'])
+            && (!('quality' in s.downloadUrl[0]) || (s.downloadUrl[0].quality is string && s.downloadUrl[0].quality.size() <= 32))
+            && (!('url' in s.downloadUrl[0]) || (s.downloadUrl[0].url is string && s.downloadUrl[0].url.size() <= 512))
+          ))
+        ));
+    }
+
+    // Pillar 2 & 6: Strict UserProfile validation & anti-spoofing
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'name', 'preferredQuality', 'autoResumeOnInterruption', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'name', 'avatarUrl', 'avatarColor', 'preferredQuality', 'autoResumeOnInterruption', 'soundProfile', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid) && data.uid == userId && data.uid == request.auth.uid
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 256
+        && (!('email' in request.auth.token) || request.auth.token.email == null || data.email == request.auth.token.email)
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 100
+        && (!('avatarUrl' in data) || (data.avatarUrl is string && data.avatarUrl.size() <= 512 && data.avatarUrl.matches('^https://.*')))
+        && (!('avatarColor' in data) || (data.avatarColor is string && data.avatarColor.size() <= 100))
+        && data.preferredQuality in ['12kbps', '48kbps', '96kbps', '160kbps', '320kbps']
+        && data.autoResumeOnInterruption is bool
+        && (!('soundProfile' in data) || data.soundProfile in ['studio', 'bass', 'vocal', 'concert', 'night', 'flat'])
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Pillar 2 & 5: Strict Playlist validation (checks both head and tail song elements)
+    function isValidPlaylist(data, userId, playlistId) {
+      return data.keys().hasAll(['id', 'ownerId', 'name', 'description', 'coverColor', 'songs', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerId', 'name', 'description', 'coverColor', 'coverUrl', 'songs', 'createdAt', 'updatedAt'])
+        && isValidId(data.id) && data.id == playlistId
+        && isValidId(data.ownerId) && data.ownerId == userId && data.ownerId == request.auth.uid
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 120
+        && data.description is string && data.description.size() <= 300
+        && data.coverColor is string && data.coverColor.size() <= 100
+        && (!('coverUrl' in data) || (data.coverUrl is string && data.coverUrl.size() <= 100000 && (data.coverUrl == '' || data.coverUrl.matches('^(https://|data:image/).*'))))
+        && data.songs is list && data.songs.size() <= 450
+        && (data.songs.size() == 0 || (
+          isValidSongMap(data.songs[0])
+          && isValidSongMap(data.songs[data.songs.size() - 1])
+        ))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Pillar 2: Strict LikedSong validation
+    function isValidLikedSong(data, userId, songId) {
+      return data.keys().hasAll(['id', 'ownerId', 'song', 'likedAt'])
+        && data.keys().hasOnly(['id', 'ownerId', 'song', 'likedAt'])
+        && isValidId(data.id) && data.id == songId
+        && isValidId(data.ownerId) && data.ownerId == userId && data.ownerId == request.auth.uid
+        && isValidSongMap(data.song)
+        && data.likedAt is timestamp;
+    }
+
+    // User Profiles (strict PII owner-only access, directory listing disabled)
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow list: if false;
+      allow create: if isValidId(userId)
+        && isOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId)
+        && isOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().email == existing().email
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly(['name', 'avatarUrl', 'avatarColor', 'preferredQuality', 'autoResumeOnInterruption', 'soundProfile', 'updatedAt'])
+          || incoming().diff(existing()).affectedKeys().hasOnly(['preferredQuality', 'updatedAt'])
+          || incoming().diff(existing()).affectedKeys().hasOnly(['autoResumeOnInterruption', 'updatedAt'])
+          || incoming().diff(existing()).affectedKeys().hasOnly(['soundProfile', 'updatedAt'])
+        );
+      allow delete: if isValidId(userId) && isOwner(userId);
+
+      // User Playlists subcollection (Master Gate fetches parent /users/{userId} and verifies uid)
+      match /playlists/{playlistId} {
+        allow get: if isValidId(userId) && isValidId(playlistId) && isOwner(userId);
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isValidId(userId)
+          && isValidId(playlistId)
+          && isOwner(userId)
+          && isValidPlaylist(incoming(), userId, playlistId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+        allow update: if isValidId(userId)
+          && isValidId(playlistId)
+          && isOwner(userId)
+          && isValidPlaylist(incoming(), userId, playlistId)
+          && incoming().id == existing().id
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['songs', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'coverColor', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'coverColor', 'coverUrl', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'coverColor', 'songs', 'updatedAt'])
+            || incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'coverColor', 'coverUrl', 'songs', 'updatedAt'])
+          );
+        allow delete: if isValidId(userId) && isValidId(playlistId) && isOwner(userId);
+      }
+
+      // User Liked Songs subcollection (Master Gate fetches parent /users/{userId} and verifies uid)
+      match /likedSongs/{songId} {
+        allow get: if isValidId(userId) && isValidId(songId) && isOwner(userId);
+        allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isValidId(userId)
+          && isValidId(songId)
+          && isOwner(userId)
+          && isValidLikedSong(incoming(), userId, songId)
+          && incoming().likedAt == request.time
+          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+        allow update: if isValidId(userId)
+          && isValidId(songId)
+          && isOwner(userId)
+          && isValidLikedSong(incoming(), userId, songId)
+          && incoming().id == existing().id
+          && incoming().ownerId == existing().ownerId
+          && incoming().likedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['song', 'likedAt'])
+          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+        allow delete: if isValidId(userId) && isValidId(songId) && isOwner(userId);
+      }
+    }
+  }
+}

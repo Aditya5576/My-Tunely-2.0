@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="tunelyBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="55%" stop-color="#18123b"/>
+      <stop offset="100%" stop-color="#070a13"/>
+    </linearGradient>
+    <linearGradient id="tunelyGrad" x1="12%" y1="8%" x2="88%" y2="92%">
+      <stop offset="0%" stop-color="#6366f1"/>
+      <stop offset="52%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#ec4899"/>
+    </linearGradient>
+    <linearGradient id="tunelyHighlight" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.28"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="124" fill="url(#tunelyBg)"/>
+  <rect x="6" y="6" width="500" height="500" rx="118" fill="none" stroke="url(#tunelyHighlight)" stroke-width="4"/>
+
+  <!-- Acoustic Pulse Aperture Ring -->
+  <path
+    d="M 382 178 A 148 148 0 1 0 382 334"
+    fill="none"
+    stroke="url(#tunelyGrad)"
+    stroke-width="28"
+    stroke-linecap="round"
+  />
+  <path
+    d="M 342 204 A 102 102 0 1 0 342 308"
+    fill="none"
+    stroke="url(#tunelyGrad)"
+    stroke-width="14"
+    stroke-linecap="round"
+    opacity="0.45"
+  />
+
+  <!-- Harmonic Play Crest / Equalizer Bars -->
+  <rect x="192" y="198" width="28" height="116" rx="14" fill="#e0e7ff"/>
+  <rect x="242" y="150" width="28" height="212" rx="14" fill="url(#tunelyGrad)"/>
+  <rect x="292" y="218" width="28" height="76" rx="14" fill="#f5d0fe"/>
+</svg>

@@ -1,0 +1,161 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Private user account profile and playback preferences synced across devices.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID matching the document ID."
+        },
+        "email": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "Verified account email address."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "Display name."
+        },
+        "avatarUrl": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "Profile avatar URL."
+        },
+        "avatarColor": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Gradient theme class for fallback avatar."
+        },
+        "preferredQuality": {
+          "type": "string",
+          "enum": ["12kbps", "48kbps", "96kbps", "160kbps", "320kbps"],
+          "description": "Preferred streaming audio bitrate."
+        },
+        "autoResumeOnInterruption": {
+          "type": "boolean",
+          "description": "Whether playback automatically resumes after phone call interruptions."
+        },
+        "soundProfile": {
+          "type": "string",
+          "enum": ["studio", "bass", "vocal", "concert", "night", "flat"],
+          "description": "Preferred Web Audio sound mastering profile."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when profile was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when profile was last updated."
+        }
+      },
+      "required": ["uid", "email", "name", "preferredQuality", "autoResumeOnInterruption", "createdAt", "updatedAt"]
+    },
+    "Playlist": {
+      "title": "Playlist",
+      "description": "User-created music playlist synced across devices.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Playlist document identifier."
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner Firebase UID."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Playlist title."
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 300,
+          "description": "Optional playlist description."
+        },
+        "coverColor": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Gradient class for playlist artwork."
+        },
+        "coverUrl": {
+          "type": "string",
+          "maxLength": 100000,
+          "description": "Optional custom cover image URL or compressed image data URI."
+        },
+        "songs": {
+          "type": "array",
+          "description": "Ordered list of songs in the playlist (up to 450 tracks)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when playlist was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when playlist was last updated."
+        }
+      },
+      "required": ["id", "ownerId", "name", "description", "coverColor", "songs", "createdAt", "updatedAt"]
+    },
+    "LikedSong": {
+      "title": "LikedSong",
+      "description": "A song favorited by the user, synced across devices.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Song identifier."
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner Firebase UID."
+        },
+        "song": {
+          "type": "object",
+          "description": "Serialized Song metadata object."
+        },
+        "likedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when song was liked."
+        }
+      },
+      "required": ["id", "ownerId", "song", "likedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private profile and preferences for an authenticated user."
+    },
+    "/users/{userId}/playlists/{playlistId}": {
+      "schema": { "$ref": "#/entities/Playlist" },
+      "description": "Custom playlists belonging to the authenticated user."
+    },
+    "/users/{userId}/likedSongs/{songId}": {
+      "schema": { "$ref": "#/entities/LikedSong" },
+      "description": "Favorite tracks belonging to the authenticated user."
+    }
+  }
+}

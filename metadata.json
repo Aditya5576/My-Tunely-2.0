@@ -1,0 +1,6 @@
+{
+  "name": "Tunely - Mobile PWA Music & Offline Player",
+  "description": "High-quality, ad-free mobile music streaming and offline PWA player with seamless background playback, lock-screen controls, personalised multi-user playlists, and persistent local caching.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

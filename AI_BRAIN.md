@@ -143,6 +143,10 @@ flowchart TD
 12. **Search Relevance, Derivative Penalties & Near-Duplicate Tracks (Resolved in M2.8)**:
     - Addressed issue where covers, karaoke, and low-quality derivative edits outranked original studio releases for standard queries, and duplicate catalog releases cluttered search results.
     - Implemented calibrated derivative modifier penalties (-150) in `rankSongsByFameAndRelevance` with query-intent bypass (+200 for explicit derivative requests), multi-word collaboration synergy bonuses (+280), expanded vernacular query dictionaries, and near-duplicate track deduplication (`deduplicateNearIdenticalSongs`) preserving valid 320kbps streams and rich metadata.
+13. **Static Firebase Hosting & Direct Upstream Fallback (Resolved in M3)**:
+    - Configured `.firebaserc` and `firebase.json` for the `my-tunely` Hosting project, mapping `dist/` PWA static assets with explicit no-cache headers for `/index.html` and service workers, and immutable cache for `/assets/*`.
+    - Preserved `cellular-spark-p01dl` for Authentication and the named Firestore database `ai-studio-tunelymobilepwam-9ddbd400-6d72-4665-a6d5-ea6ba78023d9`; Hosting configuration does not deploy Firestore rules.
+    - Added direct client-side upstream fallback in `src/services/api.ts` when `/api/lyrics` or `/api/import-playlist` receives SPA HTML rewrites on static hosting, enabling lyrics directly via LRCLIB/JioSaavn and JioSaavn link playlist imports.
 
 ## 4. Milestone status
 
@@ -152,4 +156,4 @@ flowchart TD
 | M2.7 Playlist Sync & Text Import | Completed and verified locally (P1 SSRF hop validation, P2 concurrent multi-browser live sync merge, P3 repo hygiene, Firestore 403 rules permission fix, actionable error surfacing, strict song field whitelisting, SYNC-001 revision gap preservation, SYNC-003 authoritative last-song remote deletion propagation, SYNC-002 modal sync failure handling, and strict firestore.rules isValidSongMap schema alignment). 41/41 unit tests, TypeScript (`tsc --noEmit`), production PWA build, npx eslint firestore.rules, and git diff --check passed. |
 | M2.8 Search Ranking | Completed and verified locally (calibrated derivative demotion for covers/karaoke/slowed-reverb, collaboration intent scoring, Hindi/vernacular typo expansions, and near-duplicate track deduplication preserving 320kbps stream quality). 44/44 unit tests, TypeScript (`tsc --noEmit`), production PWA build, and `git diff --check` passed. |
 | M2.9 Security Audit & Local Commit | Completed clean local commit (verified zero secrets/.env staged, 44/44 unit tests, lint, and build passing). |
-| M3 Firebase Hosting and Express rewrite | Pending. Before exposing Express, address the outbound URL validation gap in the generic link importer. |
+| M3 Firebase Hosting and Named Database | Completed and live at https://my-tunely.web.app (Hosting project: my-tunely; Auth/DB: cellular-spark-p01dl). 44/44 unit tests, lint, and build passing. |

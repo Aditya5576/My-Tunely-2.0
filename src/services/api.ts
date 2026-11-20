@@ -72,6 +72,15 @@ export const SEED_FALLBACK_TRACKS: Song[] = [
   },
 ];
 
+function cleanLyricsSearchTitle(title: string): string {
+  return cleanHtmlEntities(title)
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/\[[^\]]*\]/g, ' ')
+    .replace(/\s+[-–—]\s+(from|hindi|punjabi|tamil|telugu|remix|version).*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export function sanitizeSearchQuery(query: string): string {
   if (!query) return '';
   return query
@@ -764,13 +773,14 @@ class JioSaavnMusicService {
       preResolvedSongs?: unknown[];
       note?: string;
       error?: string;
-    };
+    } = {};
 
     if (input.rawText?.trim()) {
       data = { platform: 'Track List', tracks: parseRawTrackList(input.rawText) };
     } else {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 30000);
+      let fetchSuccess = false;
       try {
         const res = await fetch('/api/import-playlist', {
           method: 'POST',
@@ -778,12 +788,53 @@ class JioSaavnMusicService {
           body: JSON.stringify(input),
           signal: controller.signal,
         });
-        data = await res.json();
-        if (!res.ok) {
-          throw new Error(data?.error || 'Could not read tracks from that playlist link.');
+        const contentType = res.headers.get('content-type') || '';
+        if (res.ok && contentType.includes('application/json')) {
+          data = await res.json();
+          fetchSuccess = true;
+        } else if (!res.ok && contentType.includes('application/json')) {
+          const errData = await res.json();
+          throw new Error(errData?.error || 'Could not read tracks from that playlist link.');
+        }
+      } catch (err: any) {
+        if (err?.message && !err.message.includes('JSON')) {
+          throw err;
         }
       } finally {
         clearTimeout(timer);
+      }
+
+      // If backend route returned HTML (SPA fallback on static hosting) or network failed
+      if (!fetchSuccess) {
+        const rawLink = input.url || '';
+        const lower = rawLink.toLowerCase();
+        if (lower.includes('jiosaavn.com') || lower.includes('saavn.com')) {
+          try {
+            const jsRes = await fetch(
+              `${API_BASE}/api/playlists?link=${encodeURIComponent(rawLink)}&page=0&limit=100`,
+              { headers: { Accept: 'application/json' } }
+            );
+            if (jsRes.ok) {
+              const jsJson = (await jsRes.json()) as { data?: { name?: string; songs?: unknown[] } };
+              const plData = jsJson?.data;
+              if (plData && Array.isArray(plData.songs) && plData.songs.length > 0) {
+                data = {
+                  platform: 'JioSaavn',
+                  playlistName: plData.name || 'JioSaavn Playlist',
+                  tracks: [],
+                  preResolvedSongs: plData.songs,
+                };
+                fetchSuccess = true;
+              }
+            }
+          } catch {}
+        }
+
+        if (!fetchSuccess) {
+          throw new Error(
+            'Link scraping for Spotify, Apple Music, or YouTube requires the backend server. When using static web hosting, please paste the track list text directly into the Text Import tab.'
+          );
+        }
       }
     }
 
@@ -1095,36 +1146,145 @@ class JioSaavnMusicService {
     }
     const timer = setTimeout(() => controller.abort(), 7000);
 
+    let raw: {
+      syncedLyrics?: string | null;
+      plainLyrics?: string | null;
+      source?: string;
+    } | null = null;
+
     try {
       const res = await fetch(`/api/lyrics?${params.toString()}`, {
         headers: { Accept: 'application/json' },
         signal: controller.signal,
       });
-      if (!res.ok) {
-        return { syncedLyrics: [], plainLyrics: null, source: 'error' };
+      const contentType = res.headers.get('content-type') || '';
+      if (res.ok && contentType.includes('application/json')) {
+        raw = (await res.json()) as {
+          syncedLyrics?: string | null;
+          plainLyrics?: string | null;
+          source?: string;
+        };
       }
-      const raw = (await res.json()) as {
-        syncedLyrics?: string | null;
-        plainLyrics?: string | null;
-        source?: string;
-      };
+    } catch (err: any) {
+      if (err?.name === 'AbortError' && externalSignal?.aborted) throw err;
+    }
+
+    // If backend route returned HTML (SPA fallback on static hosting) or failed, fall back to direct upstream LRCLIB & JioSaavn APIs
+    if (!raw || (!raw.syncedLyrics && !raw.plainLyrics)) {
+      raw = await this.fetchDirectUpstreamLyrics(song, controller.signal);
+    }
+
+    try {
       const payload: LyricsPayload = {
-        syncedLyrics: parseLrcLyrics(raw.syncedLyrics),
-        plainLyrics: raw.plainLyrics ? cleanHtmlEntities(raw.plainLyrics) : null,
-        source: raw.source || 'lrclib',
+        syncedLyrics: parseLrcLyrics(raw?.syncedLyrics),
+        plainLyrics: raw?.plainLyrics ? cleanHtmlEntities(raw.plainLyrics) : null,
+        source: raw?.source || 'lrclib',
       };
       if (payload.syncedLyrics.length > 0 || payload.plainLyrics) {
         this.setCachedInMemory(cacheKey, payload, 1000 * 60 * 60 * 4);
         await localDB.setCachedApi(cacheKey, payload);
       }
       return payload;
-    } catch (err: any) {
-      if (err?.name === 'AbortError' && externalSignal?.aborted) throw err;
-      return { syncedLyrics: [], plainLyrics: null, source: 'error' };
     } finally {
       clearTimeout(timer);
       if (externalSignal) externalSignal.removeEventListener('abort', onAbort);
     }
+  }
+
+  private async fetchDirectUpstreamLyrics(
+    song: Song,
+    signal?: AbortSignal
+  ): Promise<{ syncedLyrics?: string | null; plainLyrics?: string | null; source?: string }> {
+    const rawTitle = cleanHtmlEntities(song.name || '').trim();
+    const cleanTitle = cleanLyricsSearchTitle(rawTitle);
+    const primaryArtist = cleanHtmlEntities(song.artists?.primary?.[0]?.name || '').split(',')[0].trim();
+    const rawAlbum = cleanHtmlEntities(song.album?.name || '').trim();
+    const cleanAlbum = cleanLyricsSearchTitle(rawAlbum);
+    const targetDuration = Number(song.duration) || 0;
+
+    let syncedLyrics: string | null = null;
+    let plainLyrics: string | null = null;
+    let source = 'lrclib';
+
+    // 1. Direct LRCLIB exact match
+    if (cleanTitle && primaryArtist) {
+      try {
+        const params = new URLSearchParams({
+          track_name: cleanTitle,
+          artist_name: primaryArtist,
+        });
+        if (cleanAlbum) params.set('album_name', cleanAlbum);
+        if (targetDuration > 0) params.set('duration', String(Math.round(targetDuration)));
+
+        const exactRes = await fetch(`https://lrclib.net/api/get?${params.toString()}`, {
+          headers: { Accept: 'application/json' },
+          signal,
+        });
+        if (exactRes.ok) {
+          const exactJson = (await exactRes.json()) as { syncedLyrics?: string; plainLyrics?: string };
+          if (exactJson?.syncedLyrics) syncedLyrics = exactJson.syncedLyrics;
+          if (exactJson?.plainLyrics) plainLyrics = exactJson.plainLyrics;
+        }
+      } catch {}
+    }
+
+    // 2. LRCLIB search API
+    if (!syncedLyrics && cleanTitle) {
+      try {
+        const searchTerms = primaryArtist ? `${cleanTitle} ${primaryArtist}` : cleanTitle;
+        const searchRes = await fetch(
+          `https://lrclib.net/api/search?q=${encodeURIComponent(searchTerms)}`,
+          { headers: { Accept: 'application/json' }, signal }
+        );
+        if (searchRes.ok) {
+          const list = (await searchRes.json()) as Array<{
+            syncedLyrics?: string;
+            plainLyrics?: string;
+            duration?: number;
+            trackName?: string;
+          }>;
+          if (Array.isArray(list) && list.length > 0) {
+            const sorted = [...list].sort((a, b) => {
+              const aSync = a.syncedLyrics ? 1 : 0;
+              const bSync = b.syncedLyrics ? 1 : 0;
+              if (bSync !== aSync) return bSync - aSync;
+              if (targetDuration > 0) {
+                const aDiff = Math.abs((a.duration || targetDuration) - targetDuration);
+                const bDiff = Math.abs((b.duration || targetDuration) - targetDuration);
+                return aDiff - bDiff;
+              }
+              return 0;
+            });
+            const best = sorted[0];
+            if (best?.syncedLyrics) syncedLyrics = best.syncedLyrics;
+            if (!plainLyrics && best?.plainLyrics) plainLyrics = best.plainLyrics;
+          }
+        }
+      } catch {}
+    }
+
+    // 3. Fallback to direct JioSaavn lyrics API
+    if (!syncedLyrics && !plainLyrics && song.id) {
+      try {
+        const jsRes = await fetch(`${API_BASE}/api/songs/${encodeURIComponent(song.id)}/lyrics`, {
+          headers: { Accept: 'application/json' },
+          signal,
+        });
+        if (jsRes.ok) {
+          const jsJson = (await jsRes.json()) as { data?: { lyrics?: string } };
+          if (jsJson?.data?.lyrics) {
+            plainLyrics = cleanHtmlEntities(jsJson.data.lyrics.replace(/<br\s*\/?>/gi, '\n'));
+            source = 'jiosaavn';
+          }
+        }
+      } catch {}
+    }
+
+    return {
+      syncedLyrics,
+      plainLyrics,
+      source: syncedLyrics || plainLyrics ? source : 'none',
+    };
   }
 
   private deduplicateSongs(songs: Song[]): Song[] {

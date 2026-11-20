@@ -8,6 +8,8 @@
 
 | Path | Lines | Key Exports / Identifiers | Primary Responsibility |
 |:-----|:-----:|:--------------------------|:-----------------------|
+| `.firebaserc` | 15 | Firebase Project Configuration | Maps default deployment target to project `my-tunely` with target `tunely -> my-tunely`. |
+| `firebase.json` | 63 | Firebase Hosting Config | Configures static PWA hosting (`dist`) for target `tunely`, SPA rewrite `** -> /index.html`, and PWA cache-control headers including `/`. |
 | `.npmrc` | 1 | `legacy-peer-deps=true` | NPM configuration enabling automatic peer dependency resolution. |
 | `package.json` | 42 | Scripts: `dev`, `build`, `lint`, `test`, `preview` | NPM dependencies, build & test scripts, package metadata (`my-tunely-2`). |
 | `tsconfig.json` | 28 | TS Compiler Configuration | Compiler flags (ES2022, bundler module resolution, path alias `@/*`). |
@@ -45,7 +47,7 @@
 | Path | Lines | Key Exports / Identifiers | Primary Responsibility |
 |:-----|:-----:|:--------------------------|:-----------------------|
 | `src/services/db.ts` | 431 | `localDB`, `LocalDatabase`, `savePlaylist` | IndexedDB stores and cached search. Playlist writes resolve after transaction commit. |
-| `src/services/api.ts` | 1135 | `musicAPI`, `importPlaylistFromLink`, `rankSongsByFameAndRelevance` | Catalog search and ordered import resolution. Multi-tier search relevance ranking, derivative demotion, typo expansion, and track deduplication. |
+| `src/services/api.ts` | 1295 | `musicAPI`, `importPlaylistFromLink`, `rankSongsByFameAndRelevance` | Catalog search, ordered import resolution, multi-tier search relevance ranking, derivative demotion, typo expansion, track deduplication, and direct upstream HTTPS fallback for static hosting. |
 | `src/services/audioEngine.ts` | 2261 | `audioEngine`, `AudioEngine` | High-fidelity Web Audio API engine managing playback, dynamic headroom attenuation, 5-band EQ, de-zippered master gain, soft ceiling limiter, MediaSession, and sleep timer. |
 | `src/services/firebase.ts` | 555 | `syncCreateCloudPlaylist`, `syncUpdateCloudPlaylistSongs`, `recoverCloudPlaylist`, `subscribeCloudLibrary` | Firestore merge writes with monotonic revision tracking, transaction recovery, confirmed playlist snapshots, authentication and preferences. |
 | `src/context/UserContext.tsx` | 935 | `UserProvider`, `useUser`, `reorderPlaylistSongs` | Authentication, local-first playlist writes, serialized reconciliation, likes, downloads, guest quotas, cloud sync pending tracking, and actionable cloudError surfacing. |

@@ -356,3 +356,38 @@
   - Multi-word artist + title searches immediately resolve to the correct collaborative track.
   - Search results are clean and free of redundant duplicate single releases, guaranteeing 320kbps playback quality.
   - All 44 unit tests pass with zero regressions.
+
+---
+
+## ADR-015: Firebase Hosting Configuration & Direct Upstream Fallback Architecture (Milestone M3)
+- **Status**: Accepted
+- **Context**: In production on Firebase Hosting (`.web.app`), static hosting serves compiled SPA assets from `dist/` without co-hosting the Express backend server (`server.ts`). Consequently, calls to `/api/lyrics` and `/api/import-playlist` would receive the HTML SPA rewrite (`/index.html`) instead of JSON responses, causing JSON parse errors and broken lyrics or playlist imports. In addition, the named Firestore database `ai-studio-tunelymobilepwam-9ddbd400-6d72-4665-a6d5-ea6ba78023d9` and cache headers for PWA service workers and hashed assets required configuration in `firebase.json` and `.firebaserc`.
+- **Decision**:
+  1. Configured `.firebaserc` pointing `default` to `cellular-spark-p01dl`.
+  2. Configured `firebase.json`:
+     - Hosting: `"public": "dist"`, SPA rewrite `** -> /index.html`, strict PWA cache headers (`no-cache, no-store, must-revalidate` for `/index.html`, `/sw.js`, `/registerSW.js` to ensure immediate service worker updates; `public, max-age=31536000, immutable` for `/assets/**`).
+     - Firestore: mapped `firestore.rules` to named database `ai-studio-tunelymobilepwam-9ddbd400-6d72-4665-a6d5-ea6ba78023d9` and `(default)`.
+  3. Added client-side direct upstream fallback in `src/services/api.ts`:
+     - For lyrics (`getSongLyrics`): When `/api/lyrics` returns HTML or fails, falls back directly to public CORS-enabled LRCLIB exact match (`https://lrclib.net/api/get`), LRCLIB search API (`https://lrclib.net/api/search`), and JioSaavn worker API (`${API_BASE}/api/songs/:id/lyrics`).
+     - For playlist imports (`importPlaylistFromLink`): When `/api/import-playlist` returns HTML or fails, checks for JioSaavn links and queries `${API_BASE}/api/playlists` directly; for Spotify/Apple/YouTube links, provides a clear user-facing error advising tracklist text import.
+- **Consequences**:
+  - The application works completely on static Firebase Hosting without requiring an always-on Express instance for core playback, search, lyrics, downloads, or text/JioSaavn playlist imports.
+  - Development workflow on `localhost:3000` via `server.ts` remains primary and unaffected.
+  - Zero regression across all 44 unit tests.
+
+---
+
+## ADR-016: Dedicated Multi-Project Hosting Architecture (`my-tunely`) with Shared Backend (`cellular-spark-p01dl`)
+- **Status**: Accepted
+- **Context**: Tunely 2.0 requires a clean, branded public hosting domain (`https://my-tunely.web.app`) owned and maintained under `aditya.patil.tech@gmail.com` on Firebase project `my-tunely`, while preserving the existing, battle-tested Firebase Authentication and Cloud Firestore configuration on project `cellular-spark-p01dl` (`firebase-applet-config.json` with named database `ai-studio-tunelymobilepwam-9ddbd400-6d72-4665-a6d5-ea6ba78023d9`).
+- **Decision**:
+  1. Decoupled Hosting deployment targets from Firestore rules targets.
+  2. Pointed `.firebaserc` `"default"` project to `"my-tunely"`, binding `"targets"`:
+     `"my-tunely": { "hosting": { "tunely": ["my-tunely"] } }`.
+  3. Configured `firebase.json` for hosting-only deployment (`"target": "tunely"`), preserving all PWA cache headers and SPA rewrites, while removing the `"firestore"` block from `firebase.json` so CLI deploys target the dedicated hosting project without Firestore conflicts.
+  4. Preserved `firebase-applet-config.json` intact, maintaining seamless runtime communication with `cellular-spark-p01dl` for Google OAuth and Firestore sync.
+  5. Deployed live via `npx firebase-tools deploy --only hosting:tunely --project my-tunely`.
+- **Consequences**:
+  - App is live, serving production PWA assets at `https://my-tunely.web.app`.
+  - Zero regression across all 44 unit tests, PWA build, and audio/sync workflows.
+  - Runtime Auth & Firestore database isolation is preserved cleanly.

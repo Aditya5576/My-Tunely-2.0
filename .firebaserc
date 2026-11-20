@@ -1,0 +1,15 @@
+{
+  "projects": {
+    "default": "my-tunely"
+  },
+  "targets": {
+    "my-tunely": {
+      "hosting": {
+        "tunely": [
+          "my-tunely"
+        ]
+      }
+    }
+  },
+  "etags": {}
+}

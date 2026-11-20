@@ -157,3 +157,6 @@ flowchart TD
 | M2.8 Search Ranking | Completed and verified locally (calibrated derivative demotion for covers/karaoke/slowed-reverb, collaboration intent scoring, Hindi/vernacular typo expansions, and near-duplicate track deduplication preserving 320kbps stream quality). 44/44 unit tests, TypeScript (`tsc --noEmit`), production PWA build, and `git diff --check` passed. |
 | M2.9 Security Audit & Local Commit | Completed clean local commit (verified zero secrets/.env staged, 44/44 unit tests, lint, and build passing). |
 | M3 Firebase Hosting and Named Database | Completed and live at https://my-tunely.web.app (Hosting project: my-tunely; Auth/DB: cellular-spark-p01dl). 44/44 unit tests, lint, and build passing. |
+
+## M4 Local Implementation Status
+Queue completion uses live singleton state through resolveNextTrackIndex. Interruption recovery and MediaSession playbackState check both HTMLAudioElement and AudioContext; guarded AudioSession playback mode and user-gesture recovery supplement existing lifecycle hooks. Full bottom and horizontal safe areas protect mobile player/navigation layouts. Tests 45-47 cover queue boundaries/repeat, interrupted contexts and effective playback state. Local checks pass (47/47 tests, typecheck, PWA build). Physical-device foreground/background/call recovery and visual QA remain pending; M4 is not marked released.

@@ -1598,3 +1598,26 @@ test('Unit Test 44: near-duplicate tracks with identical normalized title/artist
   assert.equal(kesariyaRetained2.id, 'kesariya-320', 'Must retain 320kbps track when high quality appeared first');
   assert.equal(kesariyaRetained2.downloadUrl?.[0]?.quality, '320kbps');
 });
+test('45: natural queue completion respects repeat and boundaries', async () => {
+  const { resolveNextTrackIndex } = await import('./audioCore');
+  assert.equal(resolveNextTrackIndex(0, 3, 'off'), 1);
+  assert.equal(resolveNextTrackIndex(2, 3, 'off'), null);
+  assert.equal(resolveNextTrackIndex(2, 3, 'all'), 0);
+  assert.equal(resolveNextTrackIndex(1, 3, 'one'), 1);
+  assert.equal(resolveNextTrackIndex(0, 0, 'one'), null);
+  assert.equal(resolveNextTrackIndex(-1, 3, 'off'), null);
+});
+
+test('46: suspended and interrupted contexts can resume', async () => {
+  const { shouldAttemptAudioContextResume } = await import('./audioCore');
+  for (const state of ['suspended', 'interrupted']) assert.equal(shouldAttemptAudioContextResume(state), true);
+  for (const state of ['running', 'closed']) assert.equal(shouldAttemptAudioContextResume(state), false);
+});
+
+test('47: effective playback reflects both media and context', async () => {
+  const { resolveEffectivePlaybackState } = await import('./audioCore');
+  assert.equal(resolveEffectivePlaybackState(false, 'running'), 'playing');
+  assert.equal(resolveEffectivePlaybackState(false, undefined), 'playing');
+  assert.equal(resolveEffectivePlaybackState(true, 'running'), 'paused');
+  for (const state of ['suspended', 'interrupted', 'closed']) assert.equal(resolveEffectivePlaybackState(false, state), 'paused');
+});

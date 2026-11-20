@@ -6,6 +6,9 @@ import {
   computeHeadroomAttenuation,
   getBestImageUrl,
   getNextTrackIndex,
+  resolveNextTrackIndex,
+  shouldAttemptAudioContextResume,
+  resolveEffectivePlaybackState,
   getPrevTrackIndex,
   getResilientLowNetQuality,
   isLowNetworkSpeed,
@@ -154,6 +157,7 @@ class AudioEngine {
 
   constructor() {
     this.audio = new Audio();
+    this.configureAudioSession();
     this.audio.preload = 'auto';
     this.audio.setAttribute('playsinline', '');
     this.restoreSoundPreferences();
@@ -420,7 +424,8 @@ class AudioEngine {
       shaper.connect(masterGain);
       masterGain.connect(ctx.destination);
 
-      ctx.onstatechange = () => {
+      ctx.addEventListener('statechange', () => {
+        this.updateMediaSessionPlaybackState(this.currentSong ? 'playing' : 'none');
         const state = ctx.state as string;
         if ((state === 'suspended' || state === 'interrupted') && this.intendedPlaying && !this.userPaused) {
           this.wasPlayingBeforeInterruption = true;
@@ -431,7 +436,7 @@ class AudioEngine {
         } else if (state === 'running' && this.wasPlayingBeforeInterruption && this.autoResumeOnInterruption) {
           this.scheduleAutoResume();
         }
-      };
+      });
 
       this.audioCtx = ctx;
       this.sourceNode = source;
@@ -534,7 +539,7 @@ class AudioEngine {
     if (!this.audioCtx && !this.webAudioFailed) {
       this.initWebAudioGraph();
     }
-    if (this.audioCtx && this.audioCtx.state !== 'running') {
+    if (this.audioCtx && shouldAttemptAudioContextResume(this.audioCtx.state)) {
       return this.audioCtx.resume().then(() => {
         this.syncVolumeToAudioNodes(true);
       }).catch(() => {});
@@ -846,7 +851,7 @@ class AudioEngine {
         this.clearInterruptionWatchdog();
         return;
       }
-      if (!this.audio.paused) {
+      if (resolveEffectivePlaybackState(this.audio.paused, this.audioCtx?.state) === 'playing') {
         this.wasPlayingBeforeInterruption = false;
         this.interruptedAt = 0;
         this.clearInterruptionWatchdog();
@@ -1105,7 +1110,7 @@ class AudioEngine {
     }
     this.resetAudioContextForCallEnd();
 
-    if (!this.audio.paused) {
+    if (resolveEffectivePlaybackState(this.audio.paused, this.audioCtx?.state) === 'playing') {
       this.wasPlayingBeforeInterruption = false;
       this.interruptedAt = 0;
       this.clearAutoResumeTimers();
@@ -1135,6 +1140,10 @@ class AudioEngine {
         .then(() => {
           this.applyPendingSeekIfReady();
           this.endTrackSwitchGuard();
+          if (resolveEffectivePlaybackState(this.audio.paused, this.audioCtx?.state) !== 'playing') {
+            this.updateMediaSessionPlaybackState('paused');
+            return;
+          }
           this.playState = 'playing';
           this.wasPlayingBeforeInterruption = false;
           this.interruptedAt = 0;
@@ -1377,6 +1386,15 @@ class AudioEngine {
   }
 
   private setupInterruptionRecovery() {
+    const unlock = () => {
+      this.configureAudioSession();
+      void this.ensureAudioContextResumed();
+      if (this.autoResumeOnInterruption && this.intendedPlaying && !this.userPaused && this.currentSong &&
+          (this.audio.paused || this.audio.error)) this.play();
+    };
+    for (const event of ['touchstart', 'pointerdown', 'click']) {
+      document.addEventListener(event, unlock, { passive: true });
+    }
     const handleFocusRecoveryEvent = (evt?: Event) => {
       const detail = (evt as CustomEvent<{ state?: string; focus?: string }> | undefined)?.detail;
       const lostFocus =
@@ -1521,7 +1539,9 @@ class AudioEngine {
   private updateMediaSessionPlaybackState(state: 'playing' | 'paused' | 'none') {
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
     try {
-      navigator.mediaSession.playbackState = state;
+      navigator.mediaSession.playbackState = state === 'playing'
+        ? resolveEffectivePlaybackState(this.audio.paused, this.audioCtx?.state)
+        : state;
     } catch {}
   }
 
@@ -1672,6 +1692,8 @@ class AudioEngine {
     this.audio.src = audioSrc;
     this.syncVolumeToAudioNodes(false);
     this.updateMediaSessionMetadata(this.currentSong || song);
+    this.updateMediaSessionPosition(true);
+    this.configureAudioSession();
 
     if (autoPlay) {
       this.updateMediaSessionPlaybackState('playing');
@@ -1836,6 +1858,7 @@ class AudioEngine {
   }
 
   public play(): void {
+    this.configureAudioSession();
     this.intendedPlaying = true;
     this.userPaused = false;
     this.wasPlayingBeforeInterruption = false;
@@ -1992,12 +2015,29 @@ class AudioEngine {
   }
 
   private handleTrackEnded(): void {
-    if (this.repeatMode === 'one') {
+    // Read engine state at event time; no React render snapshot participates.
+    const nextIndex = resolveNextTrackIndex(this.queueIndex, this.queue.length, this.repeatMode);
+    if (nextIndex === null) {
+      this.pause();
+      return;
+    }
+    if (nextIndex === this.queueIndex) {
       this.seek(0);
       this.play();
     } else {
-      this.next();
+      this.queueIndex = nextIndex;
+      this.currentSong = this.queue[nextIndex];
+      void this.ensureAudioContextResumed();
+      this.loadAndPlay(this.currentSong, true, 0);
     }
+  }
+
+  private configureAudioSession(): void {
+    if (typeof navigator === 'undefined' || !('audioSession' in navigator)) return;
+    try {
+      const session = (navigator as Navigator & { audioSession?: { type: string } }).audioSession;
+      if (session) session.type = 'playback';
+    } catch { /* Older WebKit versions may expose a read-only session. */ }
   }
 
   public toggleShuffle(): void {

@@ -391,3 +391,12 @@
   - App is live, serving production PWA assets at `https://my-tunely.web.app`.
   - Zero regression across all 44 unit tests, PWA build, and audio/sync workflows.
   - Runtime Auth & Firestore database isolation is preserved cleanly.
+
+## ADR-017: Queue Completion, Audio Interruption Recovery and Mobile Safe Areas
+- Status: Implemented locally; physical iOS/Android QA pending.
+- Diagnosis: Natural completion already uses singleton engine state (no React closure) and reuses the playback element. MediaSession could report playing while its context was interrupted. Both recovery checks could stop retrying when the element was unpaused but its context remained silent. Navigation used only 20% of the bottom inset; full-player bottom padding was fixed.
+- Decision: Route natural completion through resolveNextTrackIndex with explicit off/all/one behavior. Keep synchronous audio.play() and context resume initiation together; do not await context resume before calling play and lose user activation. Preserve existing offline source resolution, sleep timer, DSP, and lock-screen action handlers.
+- Recovery: Guard AudioSession playback configuration, account for suspended/interrupted contexts, keep recovery active until element and context agree, and derive MediaSession playbackState from both. Add passive touchstart/pointerdown/click recovery to existing visibilitychange/pageshow/focus hooks, respecting user pause and auto-resume preference.
+- Layout: Use full bottom safe-area insets and horizontal insets for the shell/full player. Existing rounded mini-player and navigation borders remain. Allow viewport zoom.
+- Verification: Three new helper regression tests (45-47); 47/47 tests, tsc --noEmit, Vite PWA build and diff whitespace checks. Pure tests do not prove background playback or post-call OS behavior.
+- Device gate: On iPhone Safari/PWA and Android Chrome/PWA, verify three-track foreground/locked playback, repeat off/all/one, manual next/previous, pause during interruption, call-end resume, app reopen, offline queues, landscape safe areas and enlarged text. No deployment or push performed for this change.

@@ -157,7 +157,7 @@ function MainApp() {
   };
 
   return (
-    <div className="fixed inset-0 w-full h-full overflow-hidden bg-[var(--bg-app)] text-[var(--text-primary)] flex flex-col items-center transition-colors duration-150">
+    <div className="safe-horizontal-inset fixed inset-0 w-full h-full overflow-hidden bg-[var(--bg-app)] text-[var(--text-primary)] flex flex-col items-center transition-colors duration-150">
       {/* Subtle Top Atmospheric Ambient Light */}
       <div
         className="pointer-events-none fixed inset-x-0 top-0 h-80 transition-opacity duration-200"

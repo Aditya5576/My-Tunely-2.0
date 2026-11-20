@@ -37,7 +37,7 @@
 | `src/utils/audioCore.ts` | 819 | `SOUND_PROFILE_PRESETS`, `clampEqGain`, `computeEffectiveEqBands`, `computeHeadroomAttenuation`, `sanitizePlaylistImportTracks`, `parseLrcLyrics`, `registerMediaSessionActions`, `cleanHtmlEntities`, `formatTime`, `resolveBestStreamUrl`, `shuffleQueue`, `deduplicateNearIdenticalSongs`, `normalizeSearchText`, `stripTitleDecorations`, `getTrackQualityScore` | Pure deterministic helper functions for lyrics parsing, bitrate selection, queue management, DSP presets, headroom attenuation, strict playlist import track whitelisting and sanitization, MediaSession action registration, and near-duplicate track deduplication. |
 | `src/utils/guestLimits.ts` | 503 | `withPlaylistSongs`, `mergeCloudAndLocalPlaylists`, `reconcileConcurrentSongs`, `isSafePublicHttpUrl`, `safeFetchPublicUrl`, `formatFirebaseAuthError`, `formatFirestoreSyncError`, `sanitizePlaylistImportTracks` | Guest limits, SSRF URL security, concurrent multi-browser sync reconciliation, revision tracking, added song intent preservation, actionable sync error diagnostics, and track sanitization re-export. |
 | `src/utils/playlistText.ts` | 89 | `parseRawTrackList`, `resolveTextPlaylistTrack`, `TextPlaylistTrack` | Shared text parser and verified catalog matching. |
-| `src/utils/audioCore.test.ts` | 1600 | 44 unit tests (node:test) | Audio, search relevance & derivative ranking (#42), collaboration intent (#43), near-duplicate deduplication (#44), guest quotas, sync merge, track sanitization & whitelisting, text parsing, SSRF hop validation, concurrent sync, added songs sync, revision-gap preservation, last-song deletion propagation (SYNC-003), cloud song schema serialization (Unit 41), and Firestore error diagnostics. |
+| `src/utils/audioCore.test.ts` | 1600 | 47 unit tests (node:test) | Audio, search relevance & derivative ranking (#42), collaboration intent (#43), near-duplicate deduplication (#44), guest quotas, sync merge, track sanitization & whitelisting, text parsing, SSRF hop validation, concurrent sync, added songs sync, revision-gap preservation, last-song deletion propagation (SYNC-003), cloud song schema serialization (Unit 41), and Firestore error diagnostics. |
 | `src/utils/imageUtils.ts` | 63 | `getHighResImageUrl`, `getProxiedImageUrl` | Helpers to upscale and fallback album cover images from CDN URLs. |
 
 ---
@@ -91,3 +91,11 @@
 | `src/components/IOSInstallGuide.tsx` | 98 | `IOSInstallGuide` | Step-by-step visual sheet guiding iOS Safari users to "Add to Home Screen". |
 | `src/components/SplashScreen.tsx` | 103 | `SplashScreen` | Animated initial boot splash screen displaying Tunely branding. |
 | `src/components/TunelyLogo.tsx` | 31 | `TunelyLogo` | SVG brand icon component with animated gradient wave. |
+
+## M4 Queue, Recovery and Safe-Area Update
+- src/services/audioEngine.ts: live-state natural completion; guarded AudioSession; context-aware recovery and MediaSession state; passive gesture hooks.
+- src/utils/audioCore.ts: resolveNextTrackIndex, shouldAttemptAudioContextResume, resolveEffectivePlaybackState.
+- src/utils/audioCore.test.ts: 47 tests including M4 cases 45-47.
+- index.html: zoom-enabled viewport-fit=cover.
+- src/App.tsx and src/components/FullPlayerModal.tsx: horizontal safe-area shells.
+- src/index.css: full bottom safe areas for navigation, player and modal; shared horizontal inset utility.

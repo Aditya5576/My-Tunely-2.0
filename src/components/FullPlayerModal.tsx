@@ -194,7 +194,7 @@ export const FullPlayerModal: React.FC<FullPlayerModalProps> = ({
     : [];
 
   return (
-    <div className="fixed inset-0 z-50 bg-[var(--bg-app)] text-[var(--text-primary)] animate-fade-in flex flex-col overflow-hidden">
+    <div className="safe-horizontal-inset fixed inset-0 z-50 bg-[var(--bg-app)] text-[var(--text-primary)] animate-fade-in flex flex-col overflow-hidden">
       {/* Clipped Background ambient glow from artwork */}
       <div className="fixed inset-0 overflow-hidden pointer-events-none">
         <div

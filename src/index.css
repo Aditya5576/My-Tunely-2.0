@@ -243,7 +243,7 @@ h1, h2, h3, .font-display {
   }
 
   .safe-nav-pad {
-    padding-bottom: max(6px, calc(env(safe-area-inset-bottom, 0px) * 0.2));
+    padding-bottom: max(6px, env(safe-area-inset-bottom, 0px));
   }
 
   .safe-player-top {
@@ -251,7 +251,7 @@ h1, h2, h3, .font-display {
   }
 
   .safe-player-bottom {
-    padding-bottom: 8px;
+    padding-bottom: max(8px, env(safe-area-inset-bottom, 0px));
   }
 
   .safe-drawer-pb {
@@ -260,7 +260,12 @@ h1, h2, h3, .font-display {
 
   .safe-modal-inset {
     padding-top: calc(env(safe-area-inset-top, 0px) + 0.75rem);
-    padding-bottom: max(0.75rem, calc(env(safe-area-inset-bottom, 0px) * 0.78));
+    padding-bottom: max(0.75rem, env(safe-area-inset-bottom, 0px));
+  }
+
+  .safe-horizontal-inset {
+    padding-left: env(safe-area-inset-left, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
   }
 
   .safe-splash-pad {

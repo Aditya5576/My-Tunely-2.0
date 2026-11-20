@@ -343,6 +343,19 @@ export function shuffleQueue<T>(items: T[], currentItemIndex: number): T[] {
 /**
  * Determine next track index taking repeat mode into account
  */
+export function shouldAttemptAudioContextResume(contextState: string | undefined): boolean {
+  return contextState === 'suspended' || contextState === 'interrupted';
+}
+
+export function resolveEffectivePlaybackState(audioPaused: boolean, contextState?: string): 'paused' | 'playing' {
+  return audioPaused || (contextState !== undefined && contextState !== 'running') ? 'paused' : 'playing';
+}
+
+export function resolveNextTrackIndex(currentIndex: number, queueLength: number, repeatMode: RepeatMode): number | null {
+  if (!Number.isInteger(queueLength) || !Number.isInteger(currentIndex) || queueLength <= 0 || currentIndex < 0 || currentIndex >= queueLength) return null;
+  return getNextTrackIndex(currentIndex, queueLength, repeatMode);
+}
+
 export function getNextTrackIndex(
   currentIndex: number,
   queueLength: number,

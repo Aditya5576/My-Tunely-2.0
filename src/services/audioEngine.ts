@@ -3,6 +3,7 @@ import {
   cleanHtmlEntities,
   clampEqGain,
   computeEffectiveEqBands,
+  computeHeadroomAttenuation,
   getBestImageUrl,
   getNextTrackIndex,
   getPrevTrackIndex,
@@ -10,6 +11,7 @@ import {
   isLowNetworkSpeed,
   NetworkConnectionSnapshot,
   resolveBestStreamUrl,
+  registerMediaSessionActions,
   shuffleArray,
   shuffleQueue,
   SOUND_PROFILE_PRESETS,
@@ -26,11 +28,12 @@ const DYNAMIC_COMP_KEY = 'tunely_dynamic_comp_v2';
 const HIRES_DSP_KEY = 'tunely_hires_dsp';
 const IOS_STUDIO_EQ_KEY = 'tunely_ios_studio_eq_v2';
 const OFFLINE_IDS_CACHE_KEY = 'tunely_offline_ids_v1';
+const VOLUME_STORAGE_KEY = 'tunely_volume';
 
 function createSoftCeilingCurve(): Float32Array<ArrayBuffer> {
   const samples = 4096;
   const curve = new Float32Array(new ArrayBuffer(samples * 4));
-  const threshold = 0.88;
+  const threshold = 0.82;
   const ceiling = 0.985;
   const kneeRange = ceiling - threshold;
   for (let i = 0; i < samples; i++) {
@@ -123,6 +126,7 @@ class AudioEngine {
   private iosStudioEqEnabled: boolean = true;
   private audioCtx: AudioContext | null = null;
   private sourceNode: MediaElementAudioSourceNode | null = null;
+  private preGain: GainNode | null = null;
   private hpFilter: BiquadFilterNode | null = null;
   private subShelf: BiquadFilterNode | null = null;
   private bassPeak: BiquadFilterNode | null = null;
@@ -136,6 +140,7 @@ class AudioEngine {
   private compressor: DynamicsCompressorNode | null = null;
   private makeupGain: GainNode | null = null;
   private softCeilingShaper: WaveShaperNode | null = null;
+  private masterGain: GainNode | null = null;
   private webAudioFailed: boolean = false;
 
   // Sleep timer
@@ -152,6 +157,7 @@ class AudioEngine {
     this.audio.preload = 'auto';
     this.audio.setAttribute('playsinline', '');
     this.restoreSoundPreferences();
+    this.syncVolumeToAudioNodes(false);
     if (this.shouldUseWebAudio()) {
       this.audio.crossOrigin = 'anonymous';
     }
@@ -211,6 +217,15 @@ class AudioEngine {
       const savedIosEqRaw = localStorage.getItem(IOS_STUDIO_EQ_KEY);
       if (savedIosEqRaw === 'true' || savedIosEqRaw === 'false') {
         this.iosStudioEqEnabled = savedIosEqRaw === 'true';
+      }
+
+      const savedVolumeRaw = localStorage.getItem(VOLUME_STORAGE_KEY);
+      if (savedVolumeRaw !== null) {
+        const parsedVolume = Number(savedVolumeRaw);
+        if (isFinite(parsedVolume) && parsedVolume >= 0 && parsedVolume <= 1) {
+          this.volume = parsedVolume;
+          this.isMuted = parsedVolume === 0;
+        }
       }
     } catch {}
   }
@@ -319,6 +334,10 @@ class AudioEngine {
       }
       const source = ctx.createMediaElementSource(this.audio);
 
+      // Pre-gain node applies dynamic headroom attenuation based on EQ boosts & makeup gain
+      const preGain = ctx.createGain();
+      preGain.gain.value = 1.0;
+
       // Gentle subsonic filter removes <18Hz DC rumble while keeping full deep sub-bass weight
       const hp = ctx.createBiquadFilter();
       hp.type = 'highpass';
@@ -368,12 +387,17 @@ class AudioEngine {
       const sRL = ctx.createGain();
       const sRR = ctx.createGain();
 
-      // Stage 3: Analog-Warmth Soft-Ceiling Peak Guard (bit-transparent below 0.88, zero compression pumping)
+      // Stage 3: Analog-Warmth Soft-Ceiling Peak Guard (bit-transparent below 0.82, zero flatlining/scattering)
       const shaper = ctx.createWaveShaper();
       shaper.curve = createSoftCeilingCurve();
       shaper.oversample = '2x';
 
-      source.connect(hp);
+      // Stage 4: Dedicated Master Output Gain Node (anti-pop, smooth de-zippering, prevents volume jumps)
+      const masterGain = ctx.createGain();
+      masterGain.gain.value = this.isMuted ? 0 : this.volume;
+
+      source.connect(preGain);
+      preGain.connect(hp);
       hp.connect(sub);
       sub.connect(bass);
       bass.connect(mid);
@@ -393,7 +417,8 @@ class AudioEngine {
       sRR.connect(merger, 0, 1);
 
       merger.connect(shaper);
-      shaper.connect(ctx.destination);
+      shaper.connect(masterGain);
+      masterGain.connect(ctx.destination);
 
       ctx.onstatechange = () => {
         const state = ctx.state as string;
@@ -410,6 +435,7 @@ class AudioEngine {
 
       this.audioCtx = ctx;
       this.sourceNode = source;
+      this.preGain = preGain;
       this.hpFilter = hp;
       this.subShelf = sub;
       this.bassPeak = bass;
@@ -423,6 +449,10 @@ class AudioEngine {
       this.compressor = comp;
       this.makeupGain = gain;
       this.softCeilingShaper = shaper;
+      this.masterGain = masterGain;
+
+      // Lock audio element volume to unity so browser media player does not scale DSP input
+      this.audio.volume = 1.0;
 
       this.applySoundProfileNodes();
     } catch (err) {
@@ -434,6 +464,7 @@ class AudioEngine {
   private applySoundProfileNodes() {
     if (
       !this.audioCtx ||
+      !this.preGain ||
       !this.subShelf ||
       !this.bassPeak ||
       !this.midPeak ||
@@ -447,6 +478,10 @@ class AudioEngine {
     const preset = SOUND_PROFILE_PRESETS[this.soundProfile] || SOUND_PROFILE_PRESETS.studio;
     const effective = computeEffectiveEqBands(this.eqBands, this.bassBoost);
     const now = this.audioCtx.currentTime;
+
+    // Apply negative pre-gain headroom attenuation to prevent EQ boost & makeup clipping
+    const headroomScale = computeHeadroomAttenuation(effective, preset.makeupGain);
+    this.preGain.gain.setTargetAtTime(headroomScale, now, 0.025);
 
     // Gentle Hi-Res upper-mid & sparkle lift balanced against full bass & warm mid body
     const hiResPresenceBonus = this.hiResEnhancer && this.soundProfile !== 'flat' ? 0.5 : 0;
@@ -480,19 +515,17 @@ class AudioEngine {
       this.stereoRL.gain.setTargetAtTime(-halfW, now, 0.03);
     }
 
-    const headroomTrim = this.bassBoost > 65 ? 1 - ((this.bassBoost - 65) / 35) * 0.04 : 1;
-
     if (this.dynamicCompression && this.soundProfile !== 'flat') {
       this.compressor.threshold.setTargetAtTime(preset.compressorThreshold, now, 0.025);
       this.compressor.ratio.setTargetAtTime(preset.compressorRatio, now, 0.025);
       this.compressor.knee.setTargetAtTime(6, now, 0.025);
-      this.makeupGain.gain.setTargetAtTime(preset.makeupGain * headroomTrim, now, 0.025);
+      this.makeupGain.gain.setTargetAtTime(preset.makeupGain, now, 0.025);
     } else {
       this.compressor.threshold.setTargetAtTime(0, now, 0.025);
       this.compressor.ratio.setTargetAtTime(1, now, 0.025);
       this.compressor.knee.setTargetAtTime(0, now, 0.025);
-      const bypassGain = this.soundProfile === 'flat' ? 1.0 : 1.26;
-      this.makeupGain.gain.setTargetAtTime(bypassGain * headroomTrim, now, 0.025);
+      const bypassGain = this.soundProfile === 'flat' ? 1.0 : 1.15;
+      this.makeupGain.gain.setTargetAtTime(bypassGain, now, 0.025);
     }
   }
 
@@ -502,7 +535,9 @@ class AudioEngine {
       this.initWebAudioGraph();
     }
     if (this.audioCtx && this.audioCtx.state !== 'running') {
-      return this.audioCtx.resume().catch(() => {});
+      return this.audioCtx.resume().then(() => {
+        this.syncVolumeToAudioNodes(true);
+      }).catch(() => {});
     }
     return Promise.resolve();
   }
@@ -639,8 +674,7 @@ class AudioEngine {
       this.audio = new Audio();
       this.audio.preload = 'auto';
       this.audio.setAttribute('playsinline', '');
-      this.audio.muted = this.isMuted;
-      this.audio.volume = this.volume;
+      this.syncVolumeToAudioNodes(false);
       if ('preservesPitch' in this.audio) {
         (this.audio as HTMLAudioElement & { preservesPitch: boolean }).preservesPitch = true;
       }
@@ -1038,8 +1072,7 @@ class AudioEngine {
     this.beginTrackSwitchGuard();
     try {
       this.audio.pause();
-      this.audio.muted = this.isMuted;
-      this.audio.volume = this.volume;
+      this.syncVolumeToAudioNodes(false);
       this.audio.src = activeSrc;
       this.audio.load();
     } catch {}
@@ -1092,8 +1125,7 @@ class AudioEngine {
       this.audio.src = activeSrc;
     }
 
-    this.audio.muted = this.isMuted;
-    this.audio.volume = this.volume;
+    this.syncVolumeToAudioNodes(true);
     this.ensureAudioContextResumed();
     this.appInitiatedPlay = true;
 
@@ -1416,35 +1448,27 @@ class AudioEngine {
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
 
     try {
-      navigator.mediaSession.setActionHandler('play', () => {
-        this.ensureAudioContextResumed();
-        this.play();
+      registerMediaSessionActions(navigator.mediaSession, {
+        play: () => {
+          this.ensureAudioContextResumed();
+          this.play();
+        },
+        pause: () => {
+          this.pause();
+        },
+        previous: () => {
+          this.ensureAudioContextResumed();
+          this.previous();
+        },
+        next: () => {
+          this.ensureAudioContextResumed();
+          this.next();
+        },
+        seek: (time) => {
+          this.seek(time);
+        },
+        stop: () => this.pause(),
       });
-      navigator.mediaSession.setActionHandler('pause', () => {
-        this.pause();
-      });
-      navigator.mediaSession.setActionHandler('previoustrack', () => {
-        this.ensureAudioContextResumed();
-        this.previous();
-      });
-      navigator.mediaSession.setActionHandler('nexttrack', () => {
-        this.ensureAudioContextResumed();
-        this.next();
-      });
-      navigator.mediaSession.setActionHandler('seekto', (details) => {
-        if (details.seekTime !== undefined && details.seekTime !== null) {
-          this.seek(details.seekTime);
-        }
-      });
-      navigator.mediaSession.setActionHandler('seekbackward', (details) => {
-        const offset = details.seekOffset || 10;
-        this.seek(Math.max(0, this.audio.currentTime - offset));
-      });
-      navigator.mediaSession.setActionHandler('seekforward', (details) => {
-        const offset = details.seekOffset || 10;
-        this.seek(Math.min(this.duration, this.audio.currentTime + offset));
-      });
-      navigator.mediaSession.setActionHandler('stop', () => this.pause());
     } catch (err) {
       console.warn('[Tunely] MediaSession action handler error:', err);
     }
@@ -1646,6 +1670,7 @@ class AudioEngine {
     this.lastBufferedAdvanceAt = Date.now();
     this.beginTrackSwitchGuard();
     this.audio.src = audioSrc;
+    this.syncVolumeToAudioNodes(false);
     this.updateMediaSessionMetadata(this.currentSong || song);
 
     if (autoPlay) {
@@ -1843,8 +1868,7 @@ class AudioEngine {
       this.audio.src = activeSrc;
     }
 
-    this.audio.muted = this.isMuted;
-    this.audio.volume = this.volume;
+    this.syncVolumeToAudioNodes(true);
 
     // Optimistic synchronous UI state flip so button & artwork react in 0ms
     const hasBufferedData = this.audio.readyState >= 1;
@@ -2017,14 +2041,42 @@ class AudioEngine {
     this.notify();
   }
 
+  /**
+   * Synchronize current volume and mute state safely across both the Web Audio master gain node
+   * and the native HTMLAudioElement fallback, with smooth de-zippering to prevent pops or volume spikes.
+   */
+  private syncVolumeToAudioNodes(smooth: boolean = true): void {
+    const target = this.isMuted ? 0 : this.volume;
+    if (this.audioCtx && this.masterGain && this.audioCtx.state !== 'closed') {
+      try {
+        this.audio.volume = 1.0;
+        this.audio.muted = false;
+        const now = this.audioCtx.currentTime;
+        if (smooth) {
+          this.masterGain.gain.setTargetAtTime(target, now, 0.02);
+        } else {
+          this.masterGain.gain.setValueAtTime(target, now);
+        }
+      } catch {
+        this.audio.volume = target;
+        this.audio.muted = this.isMuted;
+      }
+    } else {
+      try {
+        this.audio.volume = target;
+        this.audio.muted = this.isMuted;
+      } catch {}
+    }
+  }
+
   public setVolume(vol: number): void {
     const clamped = Math.max(0, Math.min(1, vol));
     this.volume = clamped;
     this.isMuted = clamped === 0;
     try {
-      this.audio.volume = clamped;
-      this.audio.muted = this.isMuted;
+      localStorage.setItem(VOLUME_STORAGE_KEY, String(clamped));
     } catch {}
+    this.syncVolumeToAudioNodes(true);
     this.notify();
   }
 
@@ -2033,16 +2085,14 @@ class AudioEngine {
       if (this.volume === 0) {
         this.volume = 1.0;
         try {
-          this.audio.volume = 1.0;
+          localStorage.setItem(VOLUME_STORAGE_KEY, '1.0');
         } catch {}
       }
       this.isMuted = false;
     } else {
       this.isMuted = true;
     }
-    try {
-      this.audio.muted = this.isMuted;
-    } catch {}
+    this.syncVolumeToAudioNodes(true);
     this.notify();
   }
 

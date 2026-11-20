@@ -1,4 +1,6 @@
 import express from 'express';
+import { parseRawTrackList } from './src/utils/playlistText';
+import { isSafePublicHttpUrl, safeFetchPublicUrl } from './src/utils/guestLimits';
 import type { Request, Response } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -61,41 +63,13 @@ function cleanVideoTitleNoise(rawTitle: string): { title: string; inferredArtist
   return { title: title || rawTitle.trim(), inferredArtist };
 }
 
-function isSafePublicHttpUrl(rawUrl: string): boolean {
-  try {
-    const parsed = new URL(rawUrl);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
-    const host = parsed.hostname.toLowerCase();
-    if (
-      host === 'localhost' ||
-      host === '127.0.0.1' ||
-      host === '0.0.0.0' ||
-      host === '::1' ||
-      host.endsWith('.local') ||
-      host.endsWith('.internal') ||
-      /^10\./.test(host) ||
-      /^192\.168\./.test(host) ||
-      /^169\.254\./.test(host) ||
-      /^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
-    ) {
-      return false;
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 async function fetchText(url: string, timeoutMs: number = 9000): Promise<string> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { headers: BROWSER_HEADERS, signal: controller.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.text();
-  } finally {
-    clearTimeout(timer);
-  }
+  const res = await safeFetchPublicUrl(url, {
+    timeoutMs,
+    headers: BROWSER_HEADERS,
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return await res.text();
 }
 
 async function extractJioSaavnPlaylist(url: string): Promise<PlaylistExtractionResult> {
@@ -508,51 +482,6 @@ async function extractGenericPlaylistUrl(url: string): Promise<PlaylistExtractio
     playlistName,
     tracks: tracks.slice(0, MAX_IMPORT_TRACKS),
   };
-}
-
-function parseRawTrackList(rawText: string): ExtractedTrack[] {
-  const lines = rawText
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 1 && !/^track\s*name\s*,/i.test(l) && !/^"?track"?\s*,/i.test(l));
-
-  const tracks: ExtractedTrack[] = [];
-  const seen = new Set<string>();
-
-  for (const line of lines) {
-    if (tracks.length >= MAX_IMPORT_TRACKS) break;
-    // Strip leading track numbers like "1. " or "12) "
-    const cleanedLine = line.replace(/^\d+[\.)]\s+/, '').trim();
-    if (!cleanedLine) continue;
-
-    let title = cleanedLine;
-    let artist = '';
-
-    // CSV format ("Song","Artist" or Song,Artist)
-    if (cleanedLine.includes(',')) {
-      const cols = cleanedLine.split(',').map((c) => c.replace(/^"|"$/g, '').trim());
-      if (cols.length >= 2 && cols[0]) {
-        title = cols[0];
-        artist = cols[1] || '';
-      }
-    } else if (/\s[-–—]\s/.test(cleanedLine)) {
-      const parts = cleanedLine.split(/\s[-–—]\s/);
-      title = parts[0].trim();
-      artist = parts.slice(1).join(' ').trim();
-    } else if (/\s+by\s+/i.test(cleanedLine)) {
-      const parts = cleanedLine.split(/\s+by\s+/i);
-      title = parts[0].trim();
-      artist = parts.slice(1).join(' ').trim();
-    }
-
-    const key = `${title.toLowerCase()}::${artist.toLowerCase()}`;
-    if (title && !seen.has(key)) {
-      seen.add(key);
-      tracks.push({ title, artist });
-    }
-  }
-
-  return tracks;
 }
 
 function cleanLyricsTitle(title: string): string {

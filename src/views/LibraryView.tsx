@@ -46,6 +46,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     history,
     deletePlaylist,
     removeSongFromPlaylist,
+    reorderPlaylistSongs,
   } = useUser();
   const { playSong, playShuffled, isShuffled } = useAudio();
 
@@ -227,6 +228,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                 index={idx}
                 showIndex
                 isCustomPlaylist
+                onMoveUp={idx > 0 ? () => reorderPlaylistSongs(activePlaylist.id, s.id, -1) : undefined}
+                onMoveDown={idx < activePlaylist.songs.length - 1
+                  ? () => reorderPlaylistSongs(activePlaylist.id, s.id, 1)
+                  : undefined}
                 onOpenPlaylistModal={onOpenPlaylistModal}
                 onRemoveFromPlaylist={(sId) => removeSongFromPlaylist(activePlaylist.id, sId)}
               />

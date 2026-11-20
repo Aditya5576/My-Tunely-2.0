@@ -22,7 +22,7 @@ service cloud.firestore {
 
     // Verified Firebase Auth session required for all cloud reads/writes
     function isSignedIn() {
-      return request.auth != null && request.auth.token.email_verified == true;
+      return request.auth != null;
     }
 
     function isOwner(userId) {
@@ -101,13 +101,14 @@ service cloud.firestore {
     // Pillar 2 & 5: Strict Playlist validation (checks both head and tail song elements)
     function isValidPlaylist(data, userId, playlistId) {
       return data.keys().hasAll(['id', 'ownerId', 'name', 'description', 'coverColor', 'songs', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['id', 'ownerId', 'name', 'description', 'coverColor', 'coverUrl', 'songs', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerId', 'name', 'description', 'coverColor', 'coverUrl', 'songs', 'revision', 'createdAt', 'updatedAt'])
         && isValidId(data.id) && data.id == playlistId
         && isValidId(data.ownerId) && data.ownerId == userId && data.ownerId == request.auth.uid
         && data.name is string && data.name.size() >= 1 && data.name.size() <= 120
         && data.description is string && data.description.size() <= 300
         && data.coverColor is string && data.coverColor.size() <= 100
         && (!('coverUrl' in data) || (data.coverUrl is string && data.coverUrl.size() <= 100000 && (data.coverUrl == '' || data.coverUrl.matches('^(https://|data:image/).*'))))
+        && (!('revision' in data) || (data.revision is number && data.revision >= 0))
         && data.songs is list && data.songs.size() <= 450
         && (data.songs.size() == 0 || (
           isValidSongMap(data.songs[0])
@@ -151,7 +152,7 @@ service cloud.firestore {
         );
       allow delete: if isValidId(userId) && isOwner(userId);
 
-      // User Playlists subcollection (Master Gate fetches parent /users/{userId} and verifies uid)
+      // User Playlists subcollection (Master Gate verifies uid)
       match /playlists/{playlistId} {
         allow get: if isValidId(userId) && isValidId(playlistId) && isOwner(userId);
         allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
@@ -160,8 +161,7 @@ service cloud.firestore {
           && isOwner(userId)
           && isValidPlaylist(incoming(), userId, playlistId)
           && incoming().createdAt == request.time
-          && incoming().updatedAt == request.time
-          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+          && incoming().updatedAt == request.time;
         allow update: if isValidId(userId)
           && isValidId(playlistId)
           && isOwner(userId)
@@ -170,18 +170,11 @@ service cloud.firestore {
           && incoming().ownerId == existing().ownerId
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
-          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid
-          && (
-            incoming().diff(existing()).affectedKeys().hasOnly(['songs', 'updatedAt'])
-            || incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'coverColor', 'updatedAt'])
-            || incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'coverColor', 'coverUrl', 'updatedAt'])
-            || incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'coverColor', 'songs', 'updatedAt'])
-            || incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'coverColor', 'coverUrl', 'songs', 'updatedAt'])
-          );
+          && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'coverColor', 'coverUrl', 'songs', 'revision', 'updatedAt']);
         allow delete: if isValidId(userId) && isValidId(playlistId) && isOwner(userId);
       }
 
-      // User Liked Songs subcollection (Master Gate fetches parent /users/{userId} and verifies uid)
+      // User Liked Songs subcollection (Master Gate verifies uid)
       match /likedSongs/{songId} {
         allow get: if isValidId(userId) && isValidId(songId) && isOwner(userId);
         allow list: if isOwner(userId) && existing().ownerId == request.auth.uid;
@@ -189,8 +182,7 @@ service cloud.firestore {
           && isValidId(songId)
           && isOwner(userId)
           && isValidLikedSong(incoming(), userId, songId)
-          && incoming().likedAt == request.time
-          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+          && incoming().likedAt == request.time;
         allow update: if isValidId(userId)
           && isValidId(songId)
           && isOwner(userId)
@@ -198,8 +190,7 @@ service cloud.firestore {
           && incoming().id == existing().id
           && incoming().ownerId == existing().ownerId
           && incoming().likedAt == request.time
-          && incoming().diff(existing()).affectedKeys().hasOnly(['song', 'likedAt'])
-          && get(/databases/$(database)/documents/users/$(userId)).data.uid == request.auth.uid;
+          && incoming().diff(existing()).affectedKeys().hasOnly(['song', 'likedAt']);
         allow delete: if isValidId(userId) && isValidId(songId) && isOwner(userId);
       }
     }

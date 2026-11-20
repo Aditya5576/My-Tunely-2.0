@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { ThemeProvider } from './context/ThemeContext';
-import { UserProvider } from './context/UserContext';
+import { UserProvider, useUser } from './context/UserContext';
 import { useAudio } from './hooks/useAudio';
 import { Header } from './components/Header';
 import { BottomNav, NavTab } from './components/BottomNav';
@@ -11,6 +11,7 @@ import { SleepTimerModal } from './components/SleepTimerModal';
 import { PlaylistModal, PlaylistModalInitialMode } from './components/PlaylistModal';
 import { UserModal } from './components/UserModal';
 import { AppearanceModal } from './components/AppearanceModal';
+import { LoginGateModal } from './components/LoginGateModal';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { SplashScreen } from './components/SplashScreen';
 import { HomeView } from './views/HomeView';
@@ -20,8 +21,17 @@ import { DownloadsView } from './views/DownloadsView';
 import { Playlist, Song } from './types/music';
 
 function MainApp() {
-  const { currentSong } = useAudio();
+  const { currentSong, playState } = useAudio();
+  const {
+    isGuest,
+    isLoginGateOpen,
+    loginGateReason,
+    closeLoginGate,
+    recordGuestPlaybackSeconds,
+    recordGuestTrackFinished,
+  } = useUser();
   const mainScrollRef = useRef<HTMLElement | null>(null);
+  const lastTrackIdRef = useRef<string | null>(null);
   const [showSplash, setShowSplash] = useState(true);
   const [activeTab, setActiveTab] = useState<NavTab>('home');
   const [isFullPlayerOpen, setIsFullPlayerOpen] = useState(false);
@@ -44,6 +54,26 @@ function MainApp() {
     }
   }, [currentSong, isFullPlayerOpen]);
 
+  // Monitor guest playback duration
+  useEffect(() => {
+    if (!isGuest || playState !== 'playing') return;
+    const interval = setInterval(() => {
+      recordGuestPlaybackSeconds(1);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [isGuest, playState, recordGuestPlaybackSeconds]);
+
+  // Track finished tracks in guest mode
+  useEffect(() => {
+    if (!isGuest) return;
+    if (currentSong?.id) {
+      if (lastTrackIdRef.current && lastTrackIdRef.current !== currentSong.id) {
+        recordGuestTrackFinished();
+      }
+      lastTrackIdRef.current = currentSong.id;
+    }
+  }, [isGuest, currentSong?.id, recordGuestTrackFinished]);
+
   const anyModalOpen =
     showSplash ||
     isFullPlayerOpen ||
@@ -51,7 +81,8 @@ function MainApp() {
     isSleepTimerOpen ||
     isUserModalOpen ||
     isAppearanceModalOpen ||
-    isPlaylistModalOpen;
+    isPlaylistModalOpen ||
+    isLoginGateOpen;
 
   useEffect(() => {
     const prevHtmlOverflow = document.documentElement.style.overflow;
@@ -266,6 +297,15 @@ function MainApp() {
           <AppearanceModal
             isOpen={isAppearanceModalOpen}
             onClose={() => setIsAppearanceModalOpen(false)}
+          />
+        )}
+
+        {/* Welcome / Device Login Gate Modal */}
+        {isLoginGateOpen && (
+          <LoginGateModal
+            isOpen={isLoginGateOpen}
+            onClose={closeLoginGate}
+            reason={loginGateReason}
           />
         )}
       </div>

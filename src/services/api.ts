@@ -1,6 +1,22 @@
 import { FeedSection, LyricsPayload, Song } from '../types/music';
 import { localDB } from './db';
-import { cleanHtmlEntities, diversifySongs, parseLrcLyrics } from '../utils/audioCore';
+import { parseRawTrackList, resolveTextPlaylistTrack, type TextPlaylistTrack } from '../utils/playlistText';
+import {
+  cleanHtmlEntities,
+  diversifySongs,
+  parseLrcLyrics,
+  normalizeSearchText,
+  stripTitleDecorations,
+  getTrackQualityScore,
+  deduplicateNearIdenticalSongs,
+} from '../utils/audioCore';
+
+export {
+  normalizeSearchText,
+  stripTitleDecorations,
+  getTrackQualityScore,
+  deduplicateNearIdenticalSongs,
+};
 
 const API_BASE = 'https://jiosaavn-api.adityapatil2348.workers.dev';
 
@@ -166,21 +182,125 @@ export interface ImportPlaylistResult {
   note?: string;
 }
 
-const DERIVATIVE_MODIFIER_REGEX =
-  /\b(lofi|lo-fi|slowed|reverb|remix|mashup|karaoke|ringtone|8d|dj\s*mix|cover|instrumental|sped\s*up|unplugged|reprise)\b/i;
+export const DERIVATIVE_MODIFIER_REGEX =
+  /\b(lofi|lo-fi|lofi\s*flip|slowed|reverb|remix|mashup|karaoke|ringtone|ring\s*tone|8d|8d\s*audio|dj\s*mix|cover|cover\s*version|instrumental|sped\s*up|speed\s*up|unplugged|reprise|bass\s*boosted)\b/i;
 
-function stripTitleModifiers(title: string): string {
-  return title
-    .replace(/\([^)]*\)/g, ' ')
-    .replace(/\[[^\]]*\]/g, ' ')
-    .replace(/\s+[-–—]\s+.*$/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+export function stripTitleModifiers(title: string): string {
+  return stripTitleDecorations(title);
+}
+
+export function getBigrams(str: string): Set<string> {
+  const s = (str || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const bigrams = new Set<string>();
+  for (let i = 0; i < s.length - 1; i++) {
+    bigrams.add(s.slice(i, i + 2));
+  }
+  return bigrams;
+}
+
+export function diceCoefficient(a: string, b: string): number {
+  const sA = (a || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const sB = (b || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (sA === sB) return 1.0;
+  if (sA.length < 2 || sB.length < 2) return 0;
+  const bgA = getBigrams(sA);
+  const bgB = getBigrams(sB);
+  let intersection = 0;
+  for (const bg of bgA) {
+    if (bgB.has(bg)) intersection++;
+  }
+  const total = bgA.size + bgB.size;
+  return total > 0 ? (2 * intersection) / total : 0;
+}
+
+const COMMON_TYPOS: Record<string, string> = {
+  arjit: 'arijit',
+  arjith: 'arijit',
+  arijith: 'arijit',
+  atif: 'atif aslam',
+  shreya: 'shreya ghoshal',
+  diljit: 'diljit dosanjh',
+  chann: 'channa',
+  kabir: 'kabir singh',
+  kesaria: 'kesariya',
+  kesri: 'kesari',
+  apnabanale: 'apna bana le',
+  sitare: 'sitaare',
+  sitaron: 'sitaare',
+  tumhiho: 'tum hi ho',
+  tumhi: 'tum hi',
+  shayd: 'shayad',
+  leja: 'leja re',
+  kalank: 'kalank',
+  lutt: 'lutt putt',
+  jawan: 'jawan',
+  pathan: 'pathaan',
+};
+
+const COMMON_ARTISTS = [
+  'arijit singh',
+  'arjit singh',
+  'neha kakkar',
+  'shreya ghoshal',
+  'atif aslam',
+  'diljit dosanjh',
+  'pritam',
+  'badshah',
+  'yo yo honey singh',
+  'jubin nautiyal',
+  'armaan malik',
+  'darshan raval',
+  'sidhu moose wala',
+  'kk',
+  'sunidhi chauhan',
+  'sachin-jigar',
+  'anirudh ravichander',
+  'vishal-shekhar',
+];
+
+export function generateSearchQueryVariants(rawQuery: string): string[] {
+  const clean = sanitizeSearchQuery(rawQuery).toLowerCase().trim();
+  if (!clean || clean.length < 3) return [];
+
+  const variants = new Set<string>();
+
+  // 1. Known word/typo replacements
+  let replaced = clean;
+  for (const [typo, fix] of Object.entries(COMMON_TYPOS)) {
+    const reg = new RegExp(`\\b${typo}\\b`, 'gi');
+    if (reg.test(replaced)) {
+      replaced = replaced.replace(reg, fix).trim();
+    }
+  }
+  replaced = replaced.replace(/\bmere\s+ya\b/gi, 'mereya');
+  if (replaced !== clean) {
+    variants.add(replaced);
+  }
+
+  // 2. Extract non-artist title portion if an artist name is embedded
+  for (const artist of COMMON_ARTISTS) {
+    if (clean.includes(artist)) {
+      const stripped = clean.replace(artist, '').replace(/\s+/g, ' ').trim();
+      if (stripped.length >= 3) {
+        variants.add(stripped);
+        let strippedFixed = stripped;
+        for (const [typo, fix] of Object.entries(COMMON_TYPOS)) {
+          strippedFixed = strippedFixed.replace(new RegExp(`\\b${typo}\\b`, 'gi'), fix);
+        }
+        strippedFixed = strippedFixed.replace(/\bmere\s+ya\b/gi, 'mereya').trim();
+        if (strippedFixed !== stripped && strippedFixed.length >= 3) {
+          variants.add(strippedFixed);
+        }
+      }
+    }
+  }
+
+  return Array.from(variants).filter((v) => v !== clean);
 }
 
 /**
  * Ranks search results so globally famous original hits matching the query rank #1
- * above low-play remixes, lofi edits, mashups, or partial covers.
+ * above low-play remixes, lofi edits, mashups, karaoke, or partial covers.
  */
 export function rankSongsByFameAndRelevance(songs: Song[], query: string): Song[] {
   if (!Array.isArray(songs) || songs.length <= 1) return songs || [];
@@ -190,58 +310,151 @@ export function rankSongsByFameAndRelevance(songs: Song[], query: string): Song[
   }
 
   const qTokens = cleanQuery.split(/\s+/).filter(Boolean);
+  const compactQuery = cleanQuery.replace(/[^a-z0-9]/g, '');
   const queryRequestedDerivative = DERIVATIVE_MODIFIER_REGEX.test(cleanQuery);
+  const queryDerivativeMatches = cleanQuery.match(DERIVATIVE_MODIFIER_REGEX) || [];
 
   const scored = songs.map((song, idx) => {
     const rawTitle = cleanHtmlEntities(song.name || '').toLowerCase();
     const baseTitle = stripTitleModifiers(rawTitle);
-    const artistsStr = (song.artists?.primary || []).map((a) => cleanHtmlEntities(a.name).toLowerCase()).join(' ');
+    const compactTitle = baseTitle.replace(/[^a-z0-9]/g, '');
+    const artists = (song.artists?.primary || []).map((a) => cleanHtmlEntities(a.name).toLowerCase());
+    const artistsStr = artists.join(' ');
     const albumStr = cleanHtmlEntities(song.album?.name || '').toLowerCase();
-    const combinedText = `${rawTitle} ${artistsStr} ${albumStr}`;
+    const baseAlbum = stripTitleModifiers(albumStr);
+    const compactAlbum = baseAlbum.replace(/[^a-z0-9]/g, '');
+    const derivativeText = `${rawTitle} ${albumStr} ${artistsStr}`;
 
     let score = 0;
 
-    // 1. Title & Artist relevance matching
-    if (baseTitle === cleanQuery || rawTitle === cleanQuery) {
-      score += 80;
-    } else if (baseTitle.startsWith(cleanQuery) || rawTitle.startsWith(cleanQuery)) {
-      score += 52;
+    // --- TIER 1: EXACT MATCHES ---
+    if (baseTitle === cleanQuery || rawTitle === cleanQuery || (compactTitle && compactTitle === compactQuery)) {
+      score += 320;
+    } else if (baseAlbum === cleanQuery || albumStr === cleanQuery || (compactAlbum && compactAlbum === compactQuery)) {
+      score += 260;
+    } else if (artistsStr === cleanQuery || artists.includes(cleanQuery)) {
+      score += 230;
+    }
+
+    // --- TIER 2: PREFIX & WORD BOUNDARY MATCHES ---
+    if (baseTitle.startsWith(cleanQuery) || rawTitle.startsWith(cleanQuery)) {
+      score += 210;
+    } else if (baseTitle.split(/\s+/).some((w) => w.startsWith(cleanQuery))) {
+      score += 170;
+    } else if (baseAlbum.startsWith(cleanQuery) || albumStr.startsWith(cleanQuery)) {
+      score += 160;
+    } else if (artistsStr.startsWith(cleanQuery) || artists.some((a) => a.startsWith(cleanQuery))) {
+      score += 140;
     } else if (rawTitle.includes(cleanQuery)) {
-      score += 34;
+      score += 70;
     }
 
-    if (qTokens.length > 0) {
-      let matchedTokens = 0;
-      for (const tok of qTokens) {
-        if (combinedText.includes(tok)) matchedTokens++;
+    // --- TIER 3: MULTI-WORD COVERAGE & FUZZY MATCHES ---
+    let titleMatches = 0;
+    let artistMatches = 0;
+    let albumMatches = 0;
+    let anyMatches = 0;
+
+    for (let i = 0; i < qTokens.length; i++) {
+      const tok = qTokens[i];
+      let tokMatched = false;
+
+      // Check title match
+      if (rawTitle.includes(tok) || diceCoefficient(rawTitle, tok) >= 0.65) {
+        titleMatches++;
+        tokMatched = true;
       }
-      const coverage = matchedTokens / qTokens.length;
-      score += coverage * 40;
-      if (matchedTokens === qTokens.length) score += 20;
+      // Check adjacent syllable concatenation (e.g. 'mere' + 'ya' -> 'mereya')
+      if (!tokMatched && i + 1 < qTokens.length) {
+        const joined = tok + qTokens[i + 1];
+        if (rawTitle.includes(joined) || diceCoefficient(rawTitle, joined) >= 0.65) {
+          titleMatches += 2;
+          tokMatched = true;
+        }
+      }
+
+      // Check artist match
+      if (artistsStr.includes(tok) || artists.some((a) => diceCoefficient(a, tok) >= 0.65)) {
+        artistMatches++;
+        tokMatched = true;
+      }
+
+      // Check album match
+      if (albumStr.includes(tok) || diceCoefficient(albumStr, tok) >= 0.65) {
+        albumMatches++;
+        tokMatched = true;
+      }
+
+      if (tokMatched) {
+        anyMatches++;
+      }
     }
 
-    if (artistsStr && artistsStr.includes(cleanQuery)) {
-      score += 26;
+    const coverage = qTokens.length > 0 ? Math.min(1.0, anyMatches / qTokens.length) : 0;
+    if (coverage >= 0.99) {
+      score += 240;
+    } else if (coverage >= 0.75) {
+      score += 170;
+    } else if (coverage >= 0.5) {
+      score += 90;
+    } else if (coverage > 0) {
+      score += Math.round(coverage * 80);
     }
 
-    // 2. Global fame / popularity weighting using logarithmic playCount scale
+    // Multi-field synergy bonus
+    if (titleMatches > 0 && artistMatches > 0) score += 45;
+    if (titleMatches > 0 && albumMatches > 0) score += 35;
+
+    // --- STRUCTURED COLLABORATION INTENT BONUS (Artist + Title or Movie + Title) ---
+    const titleTokenList = baseTitle.split(/\s+/).filter((t) => t.length >= 2);
+    const artistTokenList = artistsStr.split(/\s+/).filter((t) => t.length >= 2);
+    const albumTokenList = baseAlbum.split(/\s+/).filter((t) => t.length >= 2 && t !== 'single');
+
+    const titleTokensInQuery = titleTokenList.filter((t) => cleanQuery.includes(t) || qTokens.some((q) => diceCoefficient(t, q) >= 0.7));
+    const artistTokensInQuery = artistTokenList.filter((t) => cleanQuery.includes(t) || qTokens.some((q) => diceCoefficient(t, q) >= 0.7));
+    const albumTokensInQuery = albumTokenList.filter((t) => cleanQuery.includes(t) || qTokens.some((q) => diceCoefficient(t, q) >= 0.7));
+
+    const titleRatio = titleTokenList.length > 0 ? titleTokensInQuery.length / titleTokenList.length : 0;
+    const artistRatio = artistTokenList.length > 0 ? artistTokensInQuery.length / artistTokenList.length : 0;
+    const albumRatio = albumTokenList.length > 0 ? albumTokensInQuery.length / albumTokenList.length : 0;
+
+    if (titleTokensInQuery.length > 0 && artistTokensInQuery.length > 0) {
+      if (titleRatio >= 0.5 && artistRatio >= 0.5) {
+        score += 280; // Full collaboration match (e.g. "Arijit Singh Tum Hi Ho", "Pritam Shayad")
+      } else {
+        score += 130;
+      }
+    } else if (titleTokensInQuery.length > 0 && albumTokensInQuery.length > 0) {
+      if (titleRatio >= 0.5 && albumRatio >= 0.5) {
+        score += 260; // Movie + Title match (e.g. "Brahmastra Kesariya", "Ae Dil Hai Mushkil Channa")
+      } else {
+        score += 110;
+      }
+    }
+
+    // --- TIER 4: GLOBAL POPULARITY (Capped Tie-breaker) ---
     const plays = Math.max(0, Number(song.playCount) || 0);
     if (plays > 0) {
-      score += Math.log10(Math.max(10, plays)) * 16;
+      score += Math.min(25, Math.log10(Math.max(10, plays)) * 3);
     }
 
-    // 3. Penalize unrequested lofi / slowed / remix / mashup / karaoke derivatives,
-    // or boost them when the user explicitly searched for that style.
+    // --- TIER 5: DERIVATIVE PENALTY / BOOST ---
     const songHasDerivative = DERIVATIVE_MODIFIER_REGEX.test(`${rawTitle} ${albumStr}`);
     if (!queryRequestedDerivative && songHasDerivative) {
-      score -= 48;
+      score -= 150; // Calibrated demotion so original studio tracks outrank remixes/lofi/karaoke/covers
     } else if (queryRequestedDerivative && songHasDerivative) {
-      score += 65;
+      score += 160; // Explicit user request for derivative (e.g. "Kesariya Lofi", "Slowed")
+      const specificMatch = queryDerivativeMatches.some((kw) => derivativeText.includes(kw.toLowerCase()));
+      if (specificMatch) {
+        score += 50;
+      }
     }
 
-    // 4. Prefer tracks with playable stream URLs
+    // Playable audio stream URL
     if (!song.downloadUrl || song.downloadUrl.length === 0) {
-      score -= 25;
+      score -= 30;
+    } else if (song.downloadUrl.some((d) => d.quality === '320kbps' && Boolean(d.url))) {
+      score += 15;
     }
 
     return { song, score, plays, idx };
@@ -382,13 +595,17 @@ class JioSaavnMusicService {
     }
     const cleanQ = sanitizeSearchQuery(rawQuery).toLowerCase();
     const isAlbumLookup =
-      cleanQ.length >= 4 &&
+      cleanQ.length >= 3 &&
       rankedSongs.slice(0, 5).some((s) => {
         const alb = cleanHtmlEntities(s.album?.name || '').toLowerCase();
-        return alb && alb !== 'single' && alb.includes(cleanQ) && !cleanHtmlEntities(s.name).toLowerCase().includes(cleanQ);
+        return (
+          alb &&
+          alb !== 'single' &&
+          (alb.includes(cleanQ) || cleanQ.includes(alb) || diceCoefficient(alb, cleanQ) >= 0.65)
+        );
       });
 
-    return diversifySongs(rankedSongs, { maxPerAlbum: isAlbumLookup ? 3 : 1 });
+    return diversifySongs(rankedSongs, { maxPerAlbum: isAlbumLookup ? 4 : 1 });
   }
 
   private async fetchRemoteSearch(
@@ -403,59 +620,131 @@ class JioSaavnMusicService {
     const fetchLimit = Math.max(safeLimit * 2, 30);
     const primaryTimeout = slowNetwork ? 12000 : 5500;
     const secondaryTimeout = slowNetwork ? 9500 : 4500;
+    const candidateSongs: Song[] = [];
 
-    // Primary endpoint with page=1 and deep pool so globally famous originals aren't missed
-    try {
-      const url = `${API_BASE}/api/search/songs?query=${encoded}&page=1&limit=${fetchLimit}`;
-      const res = await this.fetchWithTimeout(url, primaryTimeout, externalSignal);
-      if (res.ok) {
-        const json = await res.json();
-        const rawSongs = this.extractRawSongs(json);
-        if (rawSongs.length > 0) {
-          const normalized = this.deduplicateSongs(rawSongs.map(normalizeSong));
-          const ranked = this.diversifyForQuery(
-            rankSongsByFameAndRelevance(normalized, rawQuery),
-            rawQuery,
-            forceMaxPerAlbum
-          ).slice(0, safeLimit);
-          this.setCachedInMemory(cacheKey, ranked);
-          this.warmSongDetailsCache(ranked);
-          localDB.setCachedApi(cacheKey, ranked);
-          return ranked;
+    // Parallel fetch: songs AND albums
+    const songPromise = this.fetchWithTimeout(
+      `${API_BASE}/api/search/songs?query=${encoded}&page=1&limit=${fetchLimit}`,
+      primaryTimeout,
+      externalSignal
+    )
+      .then(async (res) => {
+        if (res.ok) {
+          const json = await res.json();
+          return this.extractRawSongs(json);
         }
-      }
-    } catch (err: any) {
-      if (err?.name === 'AbortError' && externalSignal?.aborted) {
-        throw err;
+        return [];
+      })
+      .catch(() => []);
+
+    const albumPromise = this.fetchWithTimeout(
+      `${API_BASE}/api/search/albums?query=${encoded}&limit=5`,
+      primaryTimeout,
+      externalSignal
+    )
+      .then(async (res) => {
+        if (res.ok) {
+          const json = await res.json();
+          const rawAlbums = json?.data?.results || json?.data || [];
+          return Array.isArray(rawAlbums) ? rawAlbums : [];
+        }
+        return [];
+      })
+      .catch(() => []);
+
+    const [rawSongs, rawAlbums] = await Promise.all([songPromise, albumPromise]);
+
+    if (rawSongs.length > 0) {
+      candidateSongs.push(...rawSongs.map(normalizeSong));
+    }
+
+    // If an album closely matches the query, fetch its tracklist
+    if (rawAlbums.length > 0) {
+      const cleanQ = sanitizeSearchQuery(rawQuery).toLowerCase();
+      const topAlbum =
+        rawAlbums.find((alb: any) => {
+          const albName = cleanHtmlEntities(alb?.name || '').toLowerCase();
+          return (
+            albName === cleanQ ||
+            albName.startsWith(cleanQ) ||
+            albName.includes(cleanQ) ||
+            cleanQ.includes(albName) ||
+            diceCoefficient(albName, cleanQ) >= 0.65
+          );
+        }) || rawAlbums[0];
+
+      if (topAlbum?.id) {
+        try {
+          const albumRes = await this.fetchWithTimeout(
+            `${API_BASE}/api/albums?id=${topAlbum.id}`,
+            4000,
+            externalSignal
+          );
+          if (albumRes.ok) {
+            const albumJson = await albumRes.json();
+            const albumTracks = this.extractRawSongs(albumJson);
+            if (Array.isArray(albumTracks) && albumTracks.length > 0) {
+              candidateSongs.push(...albumTracks.map(normalizeSong));
+            }
+          }
+        } catch {}
       }
     }
 
-    if (externalSignal?.aborted) return [];
+    // If candidateSongs is empty, try query variants (typo corrections, artist separation)
+    if (candidateSongs.length === 0) {
+      const variants = generateSearchQueryVariants(rawQuery);
+      for (const variant of variants) {
+        if (externalSignal?.aborted) break;
+        try {
+          const varRes = await this.fetchWithTimeout(
+            `${API_BASE}/api/search/songs?query=${encodeURIComponent(variant)}&limit=${fetchLimit}`,
+            secondaryTimeout,
+            externalSignal
+          );
+          if (varRes.ok) {
+            const varJson = await varRes.json();
+            const varSongs = this.extractRawSongs(varJson);
+            if (varSongs.length > 0) {
+              candidateSongs.push(...varSongs.map(normalizeSong));
+              break;
+            }
+          }
+        } catch {}
+      }
+    }
 
-    // Secondary fallback without pagination parameters
-    try {
-      const url = `${API_BASE}/api/search/songs?query=${encoded}`;
-      const res = await this.fetchWithTimeout(url, secondaryTimeout, externalSignal);
-      if (res.ok) {
-        const json = await res.json();
-        const rawSongs = this.extractRawSongs(json);
-        if (rawSongs.length > 0) {
-          const normalized = this.deduplicateSongs(rawSongs.map(normalizeSong));
-          const ranked = this.diversifyForQuery(
-            rankSongsByFameAndRelevance(normalized, rawQuery),
-            rawQuery,
-            forceMaxPerAlbum
-          ).slice(0, safeLimit);
-          this.setCachedInMemory(cacheKey, ranked);
-          this.warmSongDetailsCache(ranked);
-          localDB.setCachedApi(cacheKey, ranked);
-          return ranked;
+    // Secondary fallback without pagination parameters if still empty
+    if (candidateSongs.length === 0 && !externalSignal?.aborted) {
+      try {
+        const url = `${API_BASE}/api/search/songs?query=${encoded}`;
+        const res = await this.fetchWithTimeout(url, secondaryTimeout, externalSignal);
+        if (res.ok) {
+          const json = await res.json();
+          const raw = this.extractRawSongs(json);
+          if (raw.length > 0) {
+            candidateSongs.push(...raw.map(normalizeSong));
+          }
+        }
+      } catch (err: any) {
+        if (err?.name === 'AbortError' && externalSignal?.aborted) {
+          throw err;
         }
       }
-    } catch (err: any) {
-      if (err?.name === 'AbortError' && externalSignal?.aborted) {
-        throw err;
-      }
+    }
+
+    if (candidateSongs.length > 0) {
+      const deduplicated = this.deduplicateSongs(candidateSongs);
+      const ranked = this.diversifyForQuery(
+        rankSongsByFameAndRelevance(deduplicated, rawQuery),
+        rawQuery,
+        forceMaxPerAlbum
+      ).slice(0, safeLimit);
+
+      this.setCachedInMemory(cacheKey, ranked);
+      this.warmSongDetailsCache(ranked);
+      localDB.setCachedApi(cacheKey, ranked);
+      return ranked;
     }
 
     return [];
@@ -468,30 +757,34 @@ class JioSaavnMusicService {
     input: ImportPlaylistInput,
     onProgress?: (completed: number, total: number, matched: number) => void
   ): Promise<ImportPlaylistResult> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 30000);
     let data: {
       platform?: string;
       playlistName?: string;
-      tracks?: Array<{ title: string; artist: string }>;
+      tracks?: TextPlaylistTrack[];
       preResolvedSongs?: unknown[];
       note?: string;
       error?: string;
     };
 
-    try {
-      const res = await fetch('/api/import-playlist', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify(input),
-        signal: controller.signal,
-      });
-      data = await res.json();
-      if (!res.ok) {
-        throw new Error(data?.error || 'Could not read tracks from that playlist link.');
+    if (input.rawText?.trim()) {
+      data = { platform: 'Track List', tracks: parseRawTrackList(input.rawText) };
+    } else {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 30000);
+      try {
+        const res = await fetch('/api/import-playlist', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: JSON.stringify(input),
+          signal: controller.signal,
+        });
+        data = await res.json();
+        if (!res.ok) {
+          throw new Error(data?.error || 'Could not read tracks from that playlist link.');
+        }
+      } finally {
+        clearTimeout(timer);
       }
-    } finally {
-      clearTimeout(timer);
     }
 
     const platform = data.platform || 'External';
@@ -513,7 +806,7 @@ class JioSaavnMusicService {
 
     const rawTracks = Array.isArray(data.tracks) ? data.tracks.slice(0, 450) : [];
     if (rawTracks.length === 0) {
-      throw new Error('No songs found in that playlist.');
+      throw new Error(input.rawText ? 'No valid song lines found in the pasted text.' : 'No songs found in that playlist.');
     }
 
     const total = rawTracks.length;
@@ -526,13 +819,19 @@ class JioSaavnMusicService {
     const resolveSingleTrack = async (track: { title: string; artist: string }): Promise<Song | null> => {
       const cleanTitle = cleanHtmlEntities(track.title || '').trim();
       const cleanArtist = cleanHtmlEntities(track.artist || '').trim();
-      if (!cleanTitle) return null;
+      if (!cleanTitle && !cleanArtist) return null;
 
-      const combinedQuery = cleanArtist ? `${cleanTitle} ${cleanArtist}` : cleanTitle;
+      const primaryQuery = cleanTitle && cleanArtist ? `${cleanTitle} ${cleanArtist}` : cleanTitle || cleanArtist;
       try {
-        let candidates = await this.searchSongs(combinedQuery, 8);
-        if (candidates.length === 0 && cleanArtist) {
+        let candidates = await this.searchSongs(primaryQuery, 8);
+        if (candidates.length === 0 && cleanTitle && cleanArtist) {
+          candidates = await this.searchSongs(`${cleanArtist} ${cleanTitle}`, 8);
+        }
+        if (candidates.length === 0 && cleanTitle) {
           candidates = await this.searchSongs(cleanTitle, 8);
+        }
+        if (candidates.length === 0 && cleanArtist) {
+          candidates = await this.searchSongs(cleanArtist, 8);
         }
         return candidates[0] || null;
       } catch {
@@ -543,7 +842,9 @@ class JioSaavnMusicService {
     const runWorker = async () => {
       while (cursor < total) {
         const idx = cursor++;
-        const match = await resolveSingleTrack(rawTracks[idx]);
+        const match = input.rawText
+          ? await resolveTextPlaylistTrack(rawTracks[idx], (query) => this.searchSongs(query, 15))
+          : await resolveSingleTrack(rawTracks[idx]);
         orderedResults[idx] = match;
         completed++;
         if (match) matchedCount++;
@@ -569,14 +870,15 @@ class JioSaavnMusicService {
   }
 
   private async searchLocalFallback(sanitized: string, safeLimit: number): Promise<Song[]> {
-    const idbMatches = await localDB.searchCachedSongs(sanitized, safeLimit);
-    if (idbMatches.length > 0) return idbMatches;
-
-    return SEED_FALLBACK_TRACKS.filter(
-      (s) =>
-        s.name.toLowerCase().includes(sanitized.toLowerCase()) ||
-        s.artists?.primary?.some((a) => a.name.toLowerCase().includes(sanitized.toLowerCase()))
-    );
+    const idbMatches = await localDB.searchCachedSongs(sanitized, safeLimit * 2);
+    const candidatePool = [...idbMatches];
+    for (const s of SEED_FALLBACK_TRACKS) {
+      if (!candidatePool.some((c) => c.id === s.id)) {
+        candidatePool.push(s);
+      }
+    }
+    const ranked = rankSongsByFameAndRelevance(candidatePool, sanitized);
+    return this.diversifyForQuery(ranked, sanitized).slice(0, safeLimit);
   }
 
   private extractRawSongs(json: any): any[] {
@@ -826,12 +1128,7 @@ class JioSaavnMusicService {
   }
 
   private deduplicateSongs(songs: Song[]): Song[] {
-    const seen = new Set<string>();
-    return songs.filter((s) => {
-      if (!s || !s.id || seen.has(s.id)) return false;
-      seen.add(s.id);
-      return true;
-    });
+    return deduplicateNearIdenticalSongs(songs);
   }
 }
 

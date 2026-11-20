@@ -191,13 +191,17 @@ class LocalDatabase {
 
       const seen = new Set<string>();
       const matches: Song[] = [];
+      const qTokens = q.split(/\s+/).filter(Boolean);
 
       const checkAndAdd = (s: Song) => {
         if (!s || !s.id || seen.has(s.id)) return;
         const name = (s.name || '').toLowerCase();
         const artists = (s.artists?.primary?.map((a) => a.name).join(' ') || '').toLowerCase();
         const album = (s.album?.name || '').toLowerCase();
-        if (name.includes(q) || artists.includes(q) || album.includes(q)) {
+        const combined = `${name} ${artists} ${album}`;
+
+        const matchesAllTokens = qTokens.length > 0 && qTokens.every((tok) => combined.includes(tok));
+        if (combined.includes(q) || matchesAllTokens) {
           seen.add(s.id);
           matches.push(s);
         }
@@ -218,6 +222,18 @@ class LocalDatabase {
           }
         }
       }
+
+      matches.sort((a, b) => {
+        const aName = (a.name || '').toLowerCase();
+        const bName = (b.name || '').toLowerCase();
+        const aExact = aName === q ? 1 : 0;
+        const bExact = bName === q ? 1 : 0;
+        if (aExact !== bExact) return bExact - aExact;
+        const aPrefix = aName.startsWith(q) ? 1 : 0;
+        const bPrefix = bName.startsWith(q) ? 1 : 0;
+        if (aPrefix !== bPrefix) return bPrefix - aPrefix;
+        return (Number(b.playCount) || 0) - (Number(a.playCount) || 0);
+      });
 
       return matches.slice(0, limit);
     } catch {
@@ -290,8 +306,19 @@ class LocalDatabase {
     return new Promise((resolve, reject) => {
       const tx = db.transaction('user_playlists', 'readwrite');
       const store = tx.objectStore('user_playlists');
-      const req = store.put(playlist);
-      req.onsuccess = () => resolve(playlist);
+      store.put(playlist);
+      tx.oncomplete = () => resolve(playlist);
+      tx.onabort = () => reject(tx.error ?? new Error('Playlist storage transaction aborted.'));
+    });
+  }
+
+  async getPlaylist(playlistId: string): Promise<Playlist | null> {
+    const db = await this.getDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('user_playlists', 'readonly');
+      const store = tx.objectStore('user_playlists');
+      const req = store.get(playlistId);
+      req.onsuccess = () => resolve((req.result as Playlist) || null);
       req.onerror = () => reject(req.error);
     });
   }

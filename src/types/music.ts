@@ -59,8 +59,11 @@ export interface Playlist {
   coverUrl?: string;
   coverColor?: string;
   createdAt: number;
+  updatedAt?: number;
+  cloudConfirmed?: true;
   songs: Song[];
   userEmail: string;
+  revision?: number;
 }
 
 export interface UserProfile {

@@ -17,7 +17,7 @@ export const Header: React.FC<HeaderProps> = ({
 
   const userInitial = profile?.name
     ? profile.name.charAt(0).toUpperCase()
-    : activeEmail.charAt(0).toUpperCase();
+    : (activeEmail || 'U').charAt(0).toUpperCase();
 
   return (
     <header className="shrink-0 z-30 w-full bg-[var(--bg-elevated)] px-3.5 sm:px-5 safe-header-pad pb-2.5 flex items-center justify-between gap-2 border-b border-[var(--border-subtle)] transition-colors duration-200">

@@ -71,6 +71,32 @@ export function computeEffectiveEqBands(bands: EqBands, bassBoostPercent: number
 }
 
 /**
+ * Compute negative pre-gain headroom attenuation (in linear scale) based on effective EQ boosts
+ * and makeup gain to guarantee the cumulative signal through EQ, compressor, and soft-limiter
+ * stays strictly within 0 dBFS without hard-clipping or flatline scattering on headsets.
+ */
+export function computeHeadroomAttenuation(effectiveBands: EqBands, makeupGain: number = 1.0): number {
+  const maxBoostDb = Math.max(
+    0,
+    effectiveBands.sub,
+    effectiveBands.bass,
+    effectiveBands.mid,
+    effectiveBands.vocal,
+    effectiveBands.air
+  );
+  // Account for constructive summing of adjacent boosted bands and makeup gain
+  const makeupDb = makeupGain > 1.0 ? 20 * Math.log10(makeupGain) : 0;
+  // Attenuate by 65% of max positive boost plus makeup gain above unity
+  const totalOverheadDb = maxBoostDb * 0.65 + makeupDb;
+  if (totalOverheadDb <= 0.05) {
+    return 1.0;
+  }
+  // Convert dB to linear gain and clamp to safe floor (minimum 0.35 to prevent volume dropping too low)
+  const linearScale = Math.pow(10, -totalOverheadDb / 20);
+  return Math.max(0.35, Math.min(1.0, Number(linearScale.toFixed(4))));
+}
+
+/**
  * Parse LRC formatted synchronized lyrics ("[mm:ss.xx] Line text") into sorted seconds + text entries
  */
 export function parseLrcLyrics(lrc: string | null | undefined): Array<{ time: number; text: string }> {
@@ -391,6 +417,128 @@ export function getNormalizedAlbumKey(song: Song): string {
   return '';
 }
 
+/**
+ * Normalizes text for search indexing and matching: removes diacritics, lowercase,
+ * removes punctuation and quotes, collapses whitespace while keeping Indic Unicode characters.
+ */
+export function normalizeSearchText(text: string): string {
+  if (!text) return '';
+  return cleanHtmlEntities(text)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/['’"`]/g, '')
+    .replace(/[^\w\s\u0900-\u097F\u0A00-\u0A7F\u0B80-\u0BFF\u0C00-\u0C7F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Strips cosmetic decoration, movie tags, video tags and trailing noise from song titles.
+ */
+export function stripTitleDecorations(title: string): string {
+  if (!title) return '';
+  return cleanHtmlEntities(title)
+    .replace(/\b(from\s+["'][^"']+["']|from\s+[^)]+)/gi, ' ')
+    .replace(/\b(official\s*(music\s*)?video|official\s*audio|lyric\s*video|full\s*song|video\s*song)\b/gi, ' ')
+    .replace(/\b(feat\.|featuring)\s+[^)]+/gi, ' ')
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/\[[^\]]*\]/g, ' ')
+    .replace(/\s+[-–—|]\s+.*$/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Calculates a quality rating score (0..150+) based on stream bitrate, image resolution,
+ * and metadata completeness to choose the best version among duplicates.
+ */
+export function getTrackQualityScore(song: Song): number {
+  if (!song) return 0;
+  let score = 0;
+  // Bitrate scoring
+  if (Array.isArray(song.downloadUrl) && song.downloadUrl.length > 0) {
+    if (song.downloadUrl.some((d) => d && d.quality === '320kbps' && typeof d.url === 'string' && d.url.trim())) {
+      score += 100;
+    } else if (song.downloadUrl.some((d) => d && d.quality === '160kbps' && typeof d.url === 'string' && d.url.trim())) {
+      score += 50;
+    } else if (song.downloadUrl.some((d) => d && typeof d.url === 'string' && d.url.trim())) {
+      score += 25;
+    }
+  }
+  // Image metadata richness
+  if (Array.isArray(song.image) && song.image.length > 0) {
+    score += Math.min(20, song.image.length * 5);
+    if (song.image.some((img) => img && (img.quality === '500x500' || img.quality === 'high') && typeof img.url === 'string' && img.url.trim())) {
+      score += 10;
+    }
+  }
+  // Album completeness
+  if (song.album?.name && song.album.name.trim().toLowerCase() !== 'single' && song.album.name.trim().toLowerCase() !== 'unknown') {
+    score += 15;
+  }
+  // Popularity / stream count
+  if (typeof song.playCount === 'number' && song.playCount > 0) {
+    score += Math.min(25, Math.log10(song.playCount) * 3);
+  }
+  return score;
+}
+
+/**
+ * Deduplicates near-identical track versions (same normalized title + primary artist within ±3s duration)
+ * while preserving distinct tracks and keeping the highest-bitrate / best-metadata version.
+ */
+export function deduplicateNearIdenticalSongs(songs: Song[]): Song[] {
+  if (!Array.isArray(songs) || songs.length <= 1) return songs || [];
+
+  const derivativePattern =
+    /\b(lofi|lo-fi|lofi\s*flip|slowed|reverb|remix|mashup|karaoke|ringtone|8d|dj\s*mix|cover|instrumental|sped\s*up|unplugged)\b/i;
+
+  const result: Song[] = [];
+  const seenIds = new Set<string>();
+
+  for (const candidate of songs) {
+    if (!candidate || !candidate.id) continue;
+    if (seenIds.has(candidate.id)) continue;
+
+    const candidateIdentity = getNormalizedSongIdentityKey(candidate);
+    const candidateDuration = Number(candidate.duration) || 0;
+    const isCandidateDerivative = derivativePattern.test(cleanHtmlEntities(candidate.name || ''));
+
+    const existingIndex = result.findIndex((existing) => {
+      if (existing.id === candidate.id) return true;
+      const existingIdentity = getNormalizedSongIdentityKey(existing);
+      if (candidateIdentity && existingIdentity && candidateIdentity === existingIdentity) {
+        // Do not merge an intentional remix/lofi edit with an original studio track
+        const isExistingDerivative = derivativePattern.test(cleanHtmlEntities(existing.name || ''));
+        if (isExistingDerivative !== isCandidateDerivative) return false;
+
+        const existingDuration = Number(existing.duration) || 0;
+        if (candidateDuration === 0 || existingDuration === 0) return true;
+        return Math.abs(candidateDuration - existingDuration) <= 3;
+      }
+      return false;
+    });
+
+    if (existingIndex >= 0) {
+      const existingSong = result[existingIndex];
+      const existingScore = getTrackQualityScore(existingSong);
+      const candidateScore = getTrackQualityScore(candidate);
+
+      if (candidateScore > existingScore) {
+        seenIds.delete(existingSong.id);
+        seenIds.add(candidate.id);
+        result[existingIndex] = candidate;
+      }
+    } else {
+      seenIds.add(candidate.id);
+      result.push(candidate);
+    }
+  }
+
+  return result;
+}
+
 export interface DiversifySongsOptions {
   /** Maximum number of songs allowed from the same album/movie (default: 1) */
   maxPerAlbum?: number;
@@ -441,3 +589,231 @@ export function diversifySongs(songs: Song[], options: DiversifySongsOptions = {
   return picked;
 }
 
+export interface MediaSessionActionCallbacks {
+  play?: () => void;
+  pause?: () => void;
+  previous?: () => void;
+  next?: () => void;
+  seek?: (time: number) => void;
+  stop?: () => void;
+}
+
+export interface MediaSessionLike {
+  setActionHandler(
+    action: string,
+    handler: ((details: { seekTime?: number | null; seekOffset?: number | null }) => void) | null
+  ): void;
+}
+
+/**
+ * Configure MediaSession action handlers for lock-screen & control-center controls.
+ *
+ * CRITICAL FOR iOS / iPhone WebKit:
+ * On iOS, registering 'seekbackward' or 'seekforward' causes Lock Screen and Control Center
+ * to replace the Previous Track and Next Track buttons with 15-second skip buttons.
+ * To ensure Previous and Next track buttons are always rendered, 'seekbackward' and
+ * 'seekforward' handlers are explicitly cleared to null.
+ */
+export function registerMediaSessionActions(
+  mediaSession: MediaSessionLike,
+  callbacks: MediaSessionActionCallbacks
+): void {
+  if (!mediaSession || typeof mediaSession.setActionHandler !== 'function') return;
+
+  // 1. Core playback & track transport
+  if (callbacks.play) {
+    try {
+      mediaSession.setActionHandler('play', () => callbacks.play!());
+    } catch {}
+  }
+  if (callbacks.pause) {
+    try {
+      mediaSession.setActionHandler('pause', () => callbacks.pause!());
+    } catch {}
+  }
+  if (callbacks.previous) {
+    try {
+      mediaSession.setActionHandler('previoustrack', () => callbacks.previous!());
+    } catch {}
+  }
+  if (callbacks.next) {
+    try {
+      mediaSession.setActionHandler('nexttrack', () => callbacks.next!());
+    } catch {}
+  }
+  if (callbacks.seek) {
+    try {
+      mediaSession.setActionHandler('seekto', (details) => {
+        if (details.seekTime !== undefined && details.seekTime !== null) {
+          callbacks.seek!(details.seekTime);
+        }
+      });
+    } catch {}
+  }
+  if (callbacks.stop) {
+    try {
+      mediaSession.setActionHandler('stop', () => callbacks.stop!());
+    } catch {}
+  }
+
+  // 2. Explicitly clear seekbackward and seekforward to guarantee iOS Lock Screen
+  // shows Next / Previous track buttons instead of ±15s seek buttons
+  try {
+    mediaSession.setActionHandler('seekbackward', null);
+  } catch {}
+  try {
+    mediaSession.setActionHandler('seekforward', null);
+  } catch {}
+}
+
+/**
+ * Pure playlist import sanitization & deduplication helper.
+ * Strips unsupported/undefined fields for Firestore safety, normalizes required Song fields,
+ * enforces bounds (duration, string lengths), and filters out duplicate track IDs.
+ */
+export function sanitizePlaylistImportTracks(tracks: Array<Partial<Song> | null | undefined>): Song[] {
+  const seenIds = new Set<string>();
+  const sanitized: Song[] = [];
+
+  for (const raw of tracks || []) {
+    if (!raw) continue;
+    const rawId = typeof raw.id === 'string' ? raw.id.trim() : '';
+    const id = rawId || `tr_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    if (seenIds.has(id)) continue;
+    seenIds.add(id);
+
+    const name = cleanHtmlEntities(typeof raw.name === 'string' ? raw.name.trim() : '') || 'Untitled Track';
+    const duration = Math.min(86400, Math.max(0, Math.round(Number(raw.duration) || 210)));
+
+    const albumName = cleanHtmlEntities(typeof raw.album?.name === 'string' ? raw.album.name.trim() : '') || 'Single';
+    const albumId = typeof raw.album?.id === 'string' && raw.album.id.trim() ? raw.album.id.trim() : 'alb';
+    const album: { id: string; name: string } = {
+      id: albumId.slice(0, 128),
+      name: albumName.slice(0, 200),
+    };
+
+    const primaryArtists = Array.isArray(raw.artists?.primary) ? raw.artists.primary : [];
+    const cleanPrimary = primaryArtists
+      .map((a) => {
+        if (!a) return null;
+        const aName = cleanHtmlEntities(typeof a.name === 'string' ? a.name.trim() : '') || 'Artist';
+        const aId = typeof a.id === 'string' && a.id.trim() ? a.id.trim() : 'artist';
+        return { id: aId.slice(0, 128), name: aName.slice(0, 120) };
+      })
+      .filter((a): a is { id: string; name: string } => Boolean(a));
+
+    const artists = {
+      primary: (cleanPrimary.length > 0 ? cleanPrimary : [{ id: 'artist', name: 'Various Artists' }]).slice(0, 10),
+    };
+
+    const image = Array.isArray(raw.image)
+      ? raw.image
+          .filter((img) => img && typeof img.url === 'string' && img.url.trim())
+          .slice(0, 6)
+          .map((img) => ({ quality: String(img.quality || '150x150').slice(0, 32), url: String(img.url).trim().slice(0, 512) }))
+      : [];
+
+    const downloadUrl = Array.isArray(raw.downloadUrl)
+      ? raw.downloadUrl
+          .filter((d) => d && typeof d.url === 'string' && d.url.trim())
+          .slice(0, 8)
+          .map((d) => ({ quality: String(d.quality || '320kbps').slice(0, 32), url: String(d.url).trim().slice(0, 512) }))
+      : [];
+
+    const cleanSong: Song = {
+      id: id.slice(0, 128),
+      name: name.slice(0, 300),
+      duration,
+      album,
+      artists,
+      image,
+      downloadUrl,
+    };
+
+    if (raw.year && String(raw.year).trim()) {
+      cleanSong.year = String(raw.year).trim().slice(0, 20);
+    }
+    if (raw.language && String(raw.language).trim()) {
+      cleanSong.language = String(raw.language).trim().slice(0, 40);
+    }
+
+    sanitized.push(cleanSong);
+  }
+
+  return sanitized;
+}
+
+export interface ParsedTrackEntry {
+  title: string;
+  artist: string;
+}
+
+/**
+ * Pure deterministic parser for pasted song lines and CSV exports.
+ * Supports:
+ * - "Arijit Singh - Kesariya" (Artist - Song)
+ * - "Kesariya - Arijit Singh" (Song - Artist)
+ * - "Kesariya by Arijit Singh" (Song by Artist)
+ * - "Kesariya, Arijit Singh" or CSV "Kesariya","Arijit Singh"
+ * - Plain song titles "Kesariya"
+ * - Numbered/bullet prefixes like "1. ", "12) ", "[1] ", "• ", "- "
+ */
+export function parseRawTrackList(rawText: string, maxTracks = 450): ParsedTrackEntry[] {
+  if (!rawText || typeof rawText !== 'string') return [];
+
+  const lines = rawText
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(
+      (l) =>
+        l.length > 0 &&
+        !/^track\s*name\s*,/i.test(l) &&
+        !/^"?track"?\s*,/i.test(l) &&
+        !/^title\s*,\s*artist/i.test(l)
+    );
+
+  const tracks: ParsedTrackEntry[] = [];
+  const seen = new Set<string>();
+
+  for (const line of lines) {
+    if (tracks.length >= maxTracks) break;
+
+    // Strip leading track numbers/bullets like "1. ", "12) ", "[1] ", "• ", "- "
+    let cleaned = line
+      .replace(/^[•*\-\d]+[\.)\]]?\s+/, '')
+      .replace(/^\[\d+\]\s*/, '')
+      .trim();
+
+    // Strip wrapping double or single quotes
+    cleaned = cleaned.replace(/^["']+|["']+$/g, '').trim();
+    if (!cleaned) continue;
+
+    let title = cleaned;
+    let artist = '';
+
+    // CSV format ("Song","Artist" or Song,Artist)
+    if (cleaned.includes(',')) {
+      const cols = cleaned.split(',').map((c) => c.replace(/^["']+|["']+$/g, '').trim());
+      if (cols.length >= 2 && cols[0]) {
+        title = cols[0];
+        artist = cols[1] || '';
+      }
+    } else if (/\s[-–—:]\s/.test(cleaned)) {
+      const parts = cleaned.split(/\s[-–—:]\s/);
+      title = parts[0].trim();
+      artist = parts.slice(1).join(' ').trim();
+    } else if (/\s+by\s+/i.test(cleaned)) {
+      const parts = cleaned.split(/\s+by\s+/i);
+      title = parts[0].trim();
+      artist = parts.slice(1).join(' ').trim();
+    }
+
+    const key = `${title.toLowerCase()}::${artist.toLowerCase()}`;
+    if (title && !seen.has(key)) {
+      seen.add(key);
+      tracks.push({ title, artist });
+    }
+  }
+
+  return tracks;
+}

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Play, MoreVertical, Heart, Download, Check, ListPlus, Radio, Trash2 } from 'lucide-react';
+import { Play, MoreVertical, Heart, Download, Check, ListPlus, Radio, Trash2, ArrowUp, ArrowDown } from 'lucide-react';
 import { Song } from '../types/music';
 import { cleanHtmlEntities, formatPlayCount, formatTime, getBestImageUrl } from '../utils/audioCore';
 import { useAudio } from '../hooks/useAudio';
@@ -13,6 +13,8 @@ interface SongRowProps {
   onOpenPlaylistModal?: (song: Song) => void;
   onRemoveFromPlaylist?: (songId: string) => void;
   isCustomPlaylist?: boolean;
+  onMoveUp?: () => void;
+  onMoveDown?: () => void;
 }
 
 export const SongRow: React.FC<SongRowProps> = ({
@@ -23,6 +25,8 @@ export const SongRow: React.FC<SongRowProps> = ({
   onOpenPlaylistModal,
   onRemoveFromPlaylist,
   isCustomPlaylist = false,
+  onMoveUp,
+  onMoveDown,
 }) => {
   const { currentSong, playState, playSong, togglePlayPause, playNext, addToQueue } = useAudio();
   const {
@@ -48,6 +52,13 @@ export const SongRow: React.FC<SongRowProps> = ({
     (song as any).primaryArtists ||
     (song as any).singers ||
     'Unknown Artist';
+  const albumName = cleanHtmlEntities(song.album?.name || '').trim();
+  const displayAlbum =
+    albumName &&
+    albumName.toLowerCase() !== 'single' &&
+    albumName.toLowerCase() !== title.toLowerCase()
+      ? albumName
+      : null;
   const artwork = getBestImageUrl(song.image, 'md');
 
   const handleRowClick = () => {
@@ -118,7 +129,10 @@ export const SongRow: React.FC<SongRowProps> = ({
                 <Check className="w-3 h-3 mr-0.5 stroke-[3]" /> Offline
               </span>
             )}
-            <span className="truncate">{artists}</span>
+            <span className="truncate">
+              {artists}
+              {displayAlbum && <span className="opacity-75"> • {displayAlbum}</span>}
+            </span>
             {song.playCount && song.playCount >= 50000 && (
               <span className="text-[10px] text-[var(--accent-primary)] font-medium tabular-nums shrink-0">
                 • {formatPlayCount(song.playCount)} plays
@@ -223,6 +237,24 @@ export const SongRow: React.FC<SongRowProps> = ({
                 </span>
               </button>
             )}
+
+            {([
+              { label: 'Move up', Icon: ArrowUp, move: onMoveUp },
+              { label: 'Move down', Icon: ArrowDown, move: onMoveDown },
+            ]).map(({ label, Icon, move }) => move && (
+              <button
+                key={label}
+                type="button"
+                onClick={() => {
+                  move();
+                  setShowMenu(false);
+                }}
+                className="w-full min-h-[44px] px-3.5 py-2.5 rounded-xl text-left hover:bg-[var(--bg-surface-hover)] flex items-center gap-3 cursor-pointer"
+              >
+                <Icon className="w-4 h-4 shrink-0" aria-hidden="true" />
+                <span className="font-medium">{label}</span>
+              </button>
+            ))}
 
             {isCustomPlaylist && onRemoveFromPlaylist && (
               <button

@@ -3,26 +3,50 @@ import type { User as FirebaseUser } from 'firebase/auth';
 import { AudioQuality, DownloadedTrack, Playlist, Song, SoundProfile, UserProfile } from '../types/music';
 import { localDB } from '../services/db';
 import { musicAPI } from '../services/api';
-import { resolveBestStreamUrl } from '../utils/audioCore';
+import { resolveBestStreamUrl, sanitizePlaylistImportTracks } from '../utils/audioCore';
 import { audioEngine } from '../services/audioEngine';
 import {
+  auth,
   onCloudAuthChange,
   signInWithGoogleCloud,
   signOutCloud,
   ensureCloudUserProfile,
   subscribeCloudLibrary,
   syncCreateCloudPlaylist,
+  recoverCloudPlaylist,
   syncUpdateCloudPlaylistDetails,
   syncUpdateCloudPlaylistSongs,
   syncDeleteCloudPlaylist,
   syncCloudLikeSong,
   syncCloudUnlikeSong,
   updateCloudUserPreferences,
-  sanitizeFirestoreId,
+  checkRedirectAuthResult,
 } from '../services/firebase';
+import {
+  canGuestModifyLibrary,
+  canGuestPlay,
+  canGuestSearch,
+  GuestUsage,
+  incrementGuestSearch,
+  loadGuestUsage,
+  mergeCloudAndLocalLikes,
+  mergeCloudAndLocalPlaylists,
+  preferLocalPlaylistSongs,
+  withPlaylistSongs,
+  recordGuestPlayback,
+  recordGuestTrackFinished,
+  resetGuestUsage,
+  saveGuestUsage,
+  formatFirebaseAuthError,
+  formatFirestoreSyncError,
+} from '../utils/guestLimits';
+
+export type AuthState = 'loading' | 'authenticated' | 'guest' | 'unauthenticated';
 
 interface UserContextType {
   activeEmail: string;
+  authState: AuthState;
+  isGuest: boolean;
   isLoggedIn: boolean;
   isCloudSynced: boolean;
   cloudAuthLoading: boolean;
@@ -35,188 +59,225 @@ interface UserContextType {
   history: Song[];
   isOfflineModeOnly: boolean;
   downloadingSongIds: Record<string, number>;
+  guestUsage: GuestUsage;
+
+  // Gate Management
+  isLoginGateOpen: boolean;
+  loginGateReason: string | null;
+  openLoginGate: (reason?: string) => void;
+  closeLoginGate: () => void;
+  continueAsGuest: () => void;
 
   // Authentication Actions
-  login: (email: string, password: string) => Promise<{ success: boolean; error?: string }>;
-  signup: (email: string, password: string, name: string) => Promise<{ success: boolean; error?: string }>;
   loginWithGoogle: () => Promise<{ success: boolean; error?: string }>;
   logout: () => Promise<void>;
-  switchUser: (email: string, name?: string) => Promise<void>;
+  manualSyncCloudNow: () => Promise<void>;
 
-  // Library & Player Settings Actions
+  // Guest Quota Helpers
+  checkGuestSearchAllowed: () => boolean;
+  recordGuestSearch: () => void;
+  checkGuestPlaybackAllowed: () => boolean;
+  recordGuestPlaybackSeconds: (seconds: number) => void;
+  recordGuestTrackFinished: () => void;
+
+  // Library Actions
   updatePreferredQuality: (quality: AudioQuality) => Promise<void>;
   updateSoundProfile: (soundProfile: SoundProfile) => Promise<void>;
   updateAutoResume: (enabled: boolean) => Promise<void>;
   toggleLiked: (song: Song) => Promise<boolean>;
   isLiked: (songId: string) => boolean;
-  createPlaylist: (name: string, description?: string, coverColor?: string, coverUrl?: string) => Promise<Playlist>;
+  createPlaylist: (name: string, description?: string, coverColor?: string, coverUrl?: string) => Promise<Playlist | null>;
   createPlaylistWithSongs: (
     name: string,
     songs: Song[],
     description?: string,
     coverColor?: string,
     coverUrl?: string
-  ) => Promise<Playlist>;
+  ) => Promise<Playlist | null>;
   updatePlaylist: (
     playlistId: string,
     updates: { name: string; description?: string; coverColor?: string; coverUrl?: string }
   ) => Promise<Playlist | null>;
   deletePlaylist: (playlistId: string) => Promise<void>;
-  addSongToPlaylist: (playlistId: string, song: Song) => Promise<void>;
-  removeSongFromPlaylist: (playlistId: string, songId: string) => Promise<void>;
+  addSongToPlaylist: (playlistId: string, song: Song) => Promise<{ success: boolean; synced: boolean; error?: string }>;
+  removeSongFromPlaylist: (playlistId: string, songId: string) => Promise<{ success: boolean; synced: boolean; error?: string }>;
+  reorderPlaylistSongs: (playlistId: string, songId: string, direction: -1 | 1) => Promise<{ success: boolean; synced: boolean; error?: string }>;
   downloadSongForOffline: (song: Song) => Promise<void>;
   deleteOfflineTrack: (songId: string) => Promise<void>;
   clearAllDownloads: () => Promise<void>;
   toggleOfflineModeOnly: () => void;
   refreshUserData: () => Promise<void>;
+  isCloudSyncing: boolean;
+  pendingPlaylistSyncIds: Set<string>;
 }
 
 const UserContext = createContext<UserContextType | undefined>(undefined);
 
-export const DEMO_ACCOUNTS = [
-  {
-    email: 'aditya.patil.tech@gmail.com',
-    password: 'password123',
-    name: 'Aditya Patil',
-    role: 'Primary Account',
-    color: 'from-violet-600 to-indigo-600',
-  },
-  {
-    email: 'sarah.beats@tunely.fm',
-    password: 'password123',
-    name: 'Sarah Beats',
-    role: 'Indie & Chill',
-    color: 'from-emerald-600 to-teal-700',
-  },
-  {
-    email: 'rockstar@groove.com',
-    password: 'password123',
-    name: 'Devon Lane',
-    role: 'High Energy & Rock',
-    color: 'from-amber-600 to-rose-700',
-  },
-];
-
 export const UserProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [activeEmail, setActiveEmail] = useState<string>(() => {
-    return localStorage.getItem('tunely_active_email') || DEMO_ACCOUNTS[0].email;
-  });
-  const [isLoggedIn, setIsLoggedIn] = useState<boolean>(() => {
-    return localStorage.getItem('tunely_is_logged_in') !== 'false';
-  });
+  const [authState, setAuthState] = useState<AuthState>('loading');
+  const [activeEmail, setActiveEmail] = useState<string>('');
   const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
   const [cloudAuthLoading, setCloudAuthLoading] = useState<boolean>(false);
   const [cloudError, setCloudError] = useState<string | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
-  const [profilesList, setProfilesList] = useState<UserProfile[]>([]);
   const [likedSongs, setLikedSongs] = useState<Song[]>([]);
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const [offlineTracks, setOfflineTracks] = useState<DownloadedTrack[]>([]);
   const [history, setHistory] = useState<Song[]>([]);
   const [isOfflineModeOnly, setIsOfflineModeOnly] = useState<boolean>(false);
   const [downloadingSongIds, setDownloadingSongIds] = useState<Record<string, number>>({});
+  const [guestUsage, setGuestUsage] = useState<GuestUsage>(() => loadGuestUsage());
+  const [pendingPlaylistSyncIds, setPendingPlaylistSyncIds] = useState<Set<string>>(new Set());
 
+  const [isLoginGateOpen, setIsLoginGateOpen] = useState<boolean>(false);
+  const [loginGateReason, setLoginGateReason] = useState<string | null>(null);
+
+  const playlistQueue = useRef<Promise<void>>(Promise.resolve());
+  const queuePlaylistWork = useCallback(<T,>(work: () => Promise<T>): Promise<T> => {
+    const next = playlistQueue.current.then(work);
+    playlistQueue.current = next.then(() => {}, () => {});
+    return next;
+  }, []);
+  const reportPlaylistSyncError = (uid: string, error?: unknown): void => {
+    if (auth.currentUser?.uid === uid) {
+      setCloudError(formatFirestoreSyncError(error));
+    }
+  };
   const cloudUnsubRef = useRef<(() => void) | null>(null);
-  const mergedCloudUidRef = useRef<string | null>(null);
   const activeEmailRef = useRef<string>(activeEmail);
-  const isLoggedInRef = useRef<boolean>(isLoggedIn);
+  const authStateRef = useRef<AuthState>(authState);
 
   useEffect(() => {
     activeEmailRef.current = activeEmail;
-    isLoggedInRef.current = isLoggedIn;
-  }, [activeEmail, isLoggedIn]);
+    authStateRef.current = authState;
+  }, [activeEmail, authState]);
 
-  // Seed demo accounts on initial run if database has no profiles
-  const seedDemoAccountsIfEmpty = useCallback(async () => {
-    const existing = await localDB.getAllProfiles();
-    if (existing.length === 0) {
-      for (const demo of DEMO_ACCOUNTS) {
-        const prof: UserProfile = {
-          email: demo.email,
-          name: demo.name,
-          password: demo.password,
-          avatarColor: demo.color,
-          createdAt: Date.now(),
-          lastActive: Date.now(),
-          preferredQuality: '320kbps',
-          autoResumeOnInterruption: true,
-          soundProfile: 'studio',
-        };
-        await localDB.saveProfile(prof);
+  const isGuest = authState === 'guest';
+  const isLoggedIn = authState === 'authenticated';
+  const isCloudSynced = !!firebaseUser && authState === 'authenticated';
 
-        await localDB.savePlaylist({
-          id: `pl_seed_${demo.email.replace(/[^\w]/g, '_')}`,
-          name: `${demo.name}'s Favorites`,
-          description: `Personalized playlist for ${demo.role}`,
-          coverColor: demo.color,
-          createdAt: Date.now(),
-          songs: [],
-          userEmail: demo.email,
-        });
-      }
-    }
+  const openLoginGate = useCallback((reason?: string) => {
+    setLoginGateReason(reason || null);
+    setIsLoginGateOpen(true);
   }, []);
 
-  const refreshUserData = useCallback(async () => {
-    await seedDemoAccountsIfEmpty();
+  const closeLoginGate = useCallback(() => {
+    setIsLoginGateOpen(false);
+    setLoginGateReason(null);
+  }, []);
 
-    if (!activeEmail || !isLoggedIn) {
+  const continueAsGuest = useCallback(() => {
+    setAuthState('guest');
+    setActiveEmail('guest@tunely.local');
+    localStorage.setItem('tunely_guest_mode', 'true');
+    localStorage.setItem('tunely_auth_state', 'guest');
+    closeLoginGate();
+
+    const guestProfile: UserProfile = {
+      email: 'guest@tunely.local',
+      name: 'Guest Listener',
+      avatarColor: 'from-slate-600 to-slate-700',
+      createdAt: Date.now(),
+      lastActive: Date.now(),
+      preferredQuality: '320kbps',
+      autoResumeOnInterruption: true,
+      soundProfile: 'studio',
+    };
+    setProfile(guestProfile);
+    setLikedSongs([]);
+    setPlaylists([]);
+  }, [closeLoginGate]);
+
+  const checkGuestSearchAllowed = useCallback((): boolean => {
+    if (!isGuest) return true;
+    const allowed = canGuestSearch(guestUsage);
+    if (!allowed) {
+      openLoginGate("You've reached the 5-search guest limit. Sign in with Google for unlimited searches.");
+    }
+    return allowed;
+  }, [isGuest, guestUsage, openLoginGate]);
+
+  const recordGuestSearch = useCallback(() => {
+    if (!isGuest) return;
+    setGuestUsage((prev) => {
+      const next = incrementGuestSearch(prev);
+      saveGuestUsage(next);
+      return next;
+    });
+  }, [isGuest]);
+
+  const checkGuestPlaybackAllowed = useCallback((): boolean => {
+    if (!isGuest) return true;
+    const allowed = canGuestPlay(guestUsage);
+    if (!allowed) {
+      audioEngine.pause();
+      openLoginGate('Guest listening preview limit reached (15 minutes). Sign in with Google for unlimited music.');
+    }
+    return allowed;
+  }, [isGuest, guestUsage, openLoginGate]);
+
+  const recordGuestPlaybackSeconds = useCallback(
+    (seconds: number) => {
+      if (!isGuest) return;
+      setGuestUsage((prev) => {
+        const next = recordGuestPlayback(prev, seconds);
+        saveGuestUsage(next);
+        if (!canGuestPlay(next)) {
+          audioEngine.pause();
+          openLoginGate('Guest listening preview limit reached (15 minutes). Sign in with Google for unlimited music.');
+        }
+        return next;
+      });
+    },
+    [isGuest, openLoginGate]
+  );
+
+  const recordGuestTrackFinishedAction = useCallback(() => {
+    if (!isGuest) return;
+    setGuestUsage((prev) => {
+      const next = recordGuestTrackFinished(prev);
+      saveGuestUsage(next);
+      if (!canGuestPlay(next)) {
+        audioEngine.pause();
+        openLoginGate('Guest listening preview limit reached (3 tracks). Sign in with Google for unlimited music.');
+      }
+      return next;
+    });
+  }, [isGuest, openLoginGate]);
+
+  const refreshUserData = useCallback(async () => {
+    if (authStateRef.current === 'guest') {
+      const downloads = await localDB.getAllOfflineTracks('guest@tunely.local');
+      setOfflineTracks(downloads);
+      return;
+    }
+
+    if (!activeEmail || authStateRef.current !== 'authenticated') {
       setProfile(null);
       setLikedSongs([]);
       setPlaylists([]);
       setOfflineTracks([]);
       setHistory([]);
-      const allProfiles = await localDB.getAllProfiles();
-      setProfilesList(allProfiles);
       return;
     }
 
     let prof = await localDB.getProfile(activeEmail);
-    if (!prof) {
-      const defaultName = activeEmail.split('@')[0].replace(/[._]/g, ' ') || 'Tunely Listener';
-      prof = {
-        email: activeEmail,
-        name: defaultName.charAt(0).toUpperCase() + defaultName.slice(1),
-        password: 'password123',
-        createdAt: Date.now(),
-        lastActive: Date.now(),
-        preferredQuality: '320kbps',
-        autoResumeOnInterruption: true,
-        soundProfile: 'studio',
-      };
-      await localDB.saveProfile(prof);
-    } else {
+    if (prof) {
       prof.lastActive = Date.now();
       await localDB.saveProfile(prof);
+      setProfile(prof);
+      audioEngine.setPreferredQuality(prof.preferredQuality);
+      audioEngine.setAutoResume(prof.autoResumeOnInterruption);
+      const hydratedProfile = prof.soundProfile || 'studio';
+      if (audioEngine.getSoundProfile() !== hydratedProfile) {
+        audioEngine.setSoundProfile(hydratedProfile);
+      }
     }
-    setProfile(prof);
-    audioEngine.setPreferredQuality(prof.preferredQuality);
-    audioEngine.setAutoResume(prof.autoResumeOnInterruption);
-    const hydratedProfile = prof.soundProfile || 'studio';
-    if (audioEngine.getSoundProfile() !== hydratedProfile) {
-      audioEngine.setSoundProfile(hydratedProfile);
-    }
-
-    const allProfiles = await localDB.getAllProfiles();
-    setProfilesList(allProfiles);
 
     const likes = await localDB.getLikedSongs(activeEmail);
     setLikedSongs(likes);
 
-    let userPlaylists = await localDB.getUserPlaylists(activeEmail);
-    if (userPlaylists.length === 0) {
-      const defaultPlaylist: Playlist = {
-        id: `pl_${Date.now()}`,
-        name: `${prof.name}'s Mix`,
-        description: 'Personalized favorite tracks and daily repeats',
-        coverColor: 'from-violet-600 to-indigo-700',
-        createdAt: Date.now(),
-        songs: [],
-        userEmail: activeEmail,
-      };
-      await localDB.savePlaylist(defaultPlaylist);
-      userPlaylists = [defaultPlaylist];
-    }
+    const userPlaylists = await localDB.getUserPlaylists(activeEmail);
     setPlaylists(userPlaylists);
 
     const downloads = await localDB.getAllOfflineTracks(activeEmail);
@@ -224,15 +285,18 @@ export const UserProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     const hist = await localDB.getHistory(activeEmail, 30);
     setHistory(hist);
-  }, [activeEmail, isLoggedIn, seedDemoAccountsIfEmpty]);
+  }, [activeEmail]);
 
+  // Check for redirect result on boot (for Safari standalone PWA)
   useEffect(() => {
-    localStorage.setItem('tunely_active_email', activeEmail);
-    localStorage.setItem('tunely_is_logged_in', isLoggedIn ? 'true' : 'false');
-    refreshUserData();
-  }, [activeEmail, isLoggedIn, refreshUserData]);
+    checkRedirectAuthResult().catch((err) => {
+      const host = typeof window !== 'undefined' ? window.location.hostname : undefined;
+      const msg = formatFirebaseAuthError(err, host);
+      setCloudError(msg);
+    });
+  }, []);
 
-  // Real-time Firebase Auth & Firestore Cloud Sync listener
+  // Firebase Auth & Firestore Real-Time Synchronizer
   useEffect(() => {
     const unsubAuth = onCloudAuthChange(async (fbUser) => {
       if (cloudUnsubRef.current) {
@@ -241,21 +305,53 @@ export const UserProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
 
       setFirebaseUser(fbUser);
+      setPlaylists([]);
       setCloudError(null);
 
       if (!fbUser) {
-        mergedCloudUidRef.current = null;
+        // No authenticated Google account
+        const savedGuest = localStorage.getItem('tunely_guest_mode') === 'true';
+        if (savedGuest) {
+          setAuthState('guest');
+          setActiveEmail('guest@tunely.local');
+          setProfile({
+            email: 'guest@tunely.local',
+            name: 'Guest Listener',
+            avatarColor: 'from-slate-600 to-slate-700',
+            createdAt: Date.now(),
+            lastActive: Date.now(),
+            preferredQuality: '320kbps',
+            autoResumeOnInterruption: true,
+            soundProfile: 'studio',
+          });
+        } else {
+          setAuthState('unauthenticated');
+          setActiveEmail('');
+          setProfile(null);
+          setIsLoginGateOpen(true);
+        }
         return;
       }
 
+      // Authenticated with Google!
       const cloudEmail = (fbUser.email || `${fbUser.uid}@tunely.app`).toLowerCase();
+      localStorage.removeItem('tunely_guest_mode');
+      localStorage.setItem('tunely_active_email', cloudEmail);
+      localStorage.setItem('tunely_auth_state', 'authenticated');
 
-      // If switching from another logged-in identity, halt active playback immediately
-      if (activeEmailRef.current !== cloudEmail || !isLoggedInRef.current) {
+      if (activeEmailRef.current !== cloudEmail && authStateRef.current === 'authenticated') {
         audioEngine.resetForAccountSwitch();
       }
 
+      setActiveEmail(cloudEmail);
+      setAuthState('authenticated');
+      setIsLoginGateOpen(false);
+
       try {
+        await queuePlaylistWork(async () => {
+          const cached = await localDB.getUserPlaylists(cloudEmail);
+          if (auth.currentUser?.uid === fbUser.uid) setPlaylists(cached);
+        });
         const existingProf = await localDB.getProfile(cloudEmail);
         const cloudPrefs = await ensureCloudUserProfile(fbUser, {
           preferredQuality: existingProf?.preferredQuality || '320kbps',
@@ -276,10 +372,8 @@ export const UserProvider: React.FC<{ children: React.ReactNode }> = ({ children
           soundProfile: cloudPrefs.soundProfile || 'studio',
         };
         await localDB.saveProfile(updatedProf);
-
-        setActiveEmail(cloudEmail);
-        setIsLoggedIn(true);
         setProfile(updatedProf);
+
         audioEngine.setPreferredQuality(updatedProf.preferredQuality);
         audioEngine.setAutoResume(updatedProf.autoResumeOnInterruption);
         const syncedProfile = updatedProf.soundProfile || 'studio';
@@ -287,56 +381,58 @@ export const UserProvider: React.FC<{ children: React.ReactNode }> = ({ children
           audioEngine.setSoundProfile(syncedProfile);
         }
 
-        const preLocalPlaylists = await localDB.getUserPlaylists(cloudEmail);
-        const preLocalLikes = await localDB.getLikedSongs(cloudEmail);
+        // Hydrate from local IndexedDB first so offline works instantly
+        const localLikes = await localDB.getLikedSongs(cloudEmail);
+        if (localLikes.length > 0) setLikedSongs(localLikes);
 
+        // Bi-directional real-time cloud listener
+        if (auth.currentUser?.uid !== fbUser.uid) return;
         cloudUnsubRef.current = subscribeCloudLibrary(
           fbUser.uid,
           cloudEmail,
-          async (cloudPlaylists) => {
-            if (mergedCloudUidRef.current !== fbUser.uid) {
-              mergedCloudUidRef.current = fbUser.uid;
-              if (cloudPlaylists.length === 0 && preLocalPlaylists.length > 0) {
-                for (const lp of preLocalPlaylists) {
-                  await syncCreateCloudPlaylist(fbUser.uid, lp).catch(() => {});
-                }
-                return;
-              }
-            }
+          (cloudPlaylists) => {
+            void queuePlaylistWork(async () => {
+              if (auth.currentUser?.uid !== fbUser.uid) return;
+              const currentLocal = await localDB.getUserPlaylists(cloudEmail);
+              const merged = mergeCloudAndLocalPlaylists(currentLocal, cloudPlaylists);
+              for (const playlist of merged) await localDB.savePlaylist(playlist);
+              if (auth.currentUser?.uid !== fbUser.uid) return;
+              setPlaylists(merged);
 
-            if (cloudPlaylists.length === 0) {
-              const starter: Playlist = {
-                id: `pl_cloud_${sanitizeFirestoreId(fbUser.uid).slice(0, 8)}`,
-                name: `${updatedProf.name}'s Mix`,
-                description: 'Synced across all your devices',
-                coverColor: updatedProf.avatarColor || 'from-violet-600 to-indigo-700',
-                createdAt: Date.now(),
-                songs: [],
-                userEmail: cloudEmail,
-              };
-              await localDB.savePlaylist(starter);
-              setPlaylists([starter]);
-              syncCreateCloudPlaylist(fbUser.uid, starter).catch(() => {});
-            } else {
-              for (const cp of cloudPlaylists) {
-                await localDB.savePlaylist(cp);
+              const cloudById = new Map(cloudPlaylists.map((playlist) => [playlist.id, playlist]));
+              for (const local of currentLocal) {
+                const cloud = cloudById.get(local.id);
+                if (!cloud && local.cloudConfirmed) {
+                  await localDB.deletePlaylist(local.id);
+                } else if (!cloud || preferLocalPlaylistSongs(local, cloud)) {
+                  void recoverCloudPlaylist(fbUser.uid, local).catch((err) => reportPlaylistSyncError(fbUser.uid, err));
+                }
               }
-              setPlaylists(cloudPlaylists);
-            }
+            }).catch((err) => {
+              reportPlaylistSyncError(fbUser.uid, err);
+            });
           },
           async (cloudLikes) => {
-            if (cloudLikes.length === 0 && preLocalLikes.length > 0) {
-              for (const ls of preLocalLikes) {
-                await syncCloudLikeSong(fbUser.uid, ls).catch(() => {});
+            const currentLocalLikes = await localDB.getLikedSongs(cloudEmail);
+            const mergedLikes = mergeCloudAndLocalLikes(currentLocalLikes, cloudLikes);
+
+            for (const s of mergedLikes) {
+              if (!currentLocalLikes.some((l) => l.id === s.id)) {
+                await localDB.toggleLikedSong(cloudEmail, s);
               }
-              setLikedSongs(preLocalLikes);
-              return;
             }
-            setLikedSongs(cloudLikes);
+            setLikedSongs(mergedLikes);
+
+            // Upload local-only likes to cloud
+            for (const loc of currentLocalLikes) {
+              if (!cloudLikes.some((c) => c.id === loc.id)) {
+                await syncCloudLikeSong(fbUser.uid, loc).catch((err) => reportPlaylistSyncError(fbUser.uid, err));
+              }
+            }
           }
         );
       } catch (err) {
-        console.warn('[Tunely Cloud Sync] Sync initialization error:', err);
+        console.warn('[Tunely Cloud Sync] Sync initialization notice:', err);
         setCloudError('Cloud sync paused — local library remains active.');
       }
     });
@@ -355,11 +451,12 @@ export const UserProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setCloudError(null);
     try {
       await signInWithGoogleCloud();
+      resetGuestUsage();
+      setGuestUsage(loadGuestUsage());
       return { success: true };
     } catch (err: any) {
-      const msg = err?.code === 'auth/popup-closed-by-user'
-        ? 'Google sign-in popup was closed before completing.'
-        : err?.message || 'Google sign-in failed. Please try again.';
+      const host = typeof window !== 'undefined' ? window.location.hostname : undefined;
+      const msg = formatFirebaseAuthError(err, host);
       setCloudError(msg);
       return { success: false, error: msg };
     } finally {
@@ -367,129 +464,53 @@ export const UserProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
-  const login = async (email: string, password: string): Promise<{ success: boolean; error?: string }> => {
-    const cleanEmail = email.trim().toLowerCase();
-    if (!cleanEmail || !password.trim()) {
-      return { success: false, error: 'Email and password are required.' };
-    }
-
-    const existing = await localDB.getProfile(cleanEmail);
-    if (!existing) {
-      return { success: false, error: 'Account not found. Please click Create Account or Continue with Google.' };
-    }
-
-    if (existing.password && existing.password !== password.trim()) {
-      return { success: false, error: 'Incorrect password. Please try again.' };
-    }
-
-    if (cleanEmail !== activeEmail || !isLoggedIn) {
-      audioEngine.resetForAccountSwitch();
-    }
-
-    if (firebaseUser) {
-      await signOutCloud().catch(() => {});
-    }
-
-    setActiveEmail(cleanEmail);
-    setIsLoggedIn(true);
-    return { success: true };
-  };
-
-  const signup = async (email: string, password: string, name: string): Promise<{ success: boolean; error?: string }> => {
-    const cleanEmail = email.trim().toLowerCase();
-    if (!cleanEmail || !password.trim()) {
-      return { success: false, error: 'Email and password are required.' };
-    }
-
-    const existing = await localDB.getProfile(cleanEmail);
-    if (existing) {
-      return { success: false, error: 'An account with this email already exists. Please log in.' };
-    }
-
-    audioEngine.resetForAccountSwitch();
-
-    if (firebaseUser) {
-      await signOutCloud().catch(() => {});
-    }
-
-    const colors = [
-      'from-violet-600 to-indigo-600',
-      'from-rose-600 to-pink-600',
-      'from-emerald-600 to-teal-700',
-      'from-amber-600 to-orange-700',
-      'from-blue-600 to-cyan-700',
-    ];
-    const pickedColor = colors[Math.floor(Math.random() * colors.length)];
-
-    const newProfile: UserProfile = {
-      email: cleanEmail,
-      name: name.trim() || cleanEmail.split('@')[0],
-      password: password.trim(),
-      avatarColor: pickedColor,
-      createdAt: Date.now(),
-      lastActive: Date.now(),
-      preferredQuality: '320kbps',
-      autoResumeOnInterruption: true,
-      soundProfile: 'studio',
-    };
-    await localDB.saveProfile(newProfile);
-
-    await localDB.savePlaylist({
-      id: `pl_${Date.now()}`,
-      name: `${newProfile.name}'s Heavy Rotation`,
-      description: 'Personalized favorite tracks and daily repeats',
-      coverColor: pickedColor,
-      createdAt: Date.now(),
-      songs: [],
-      userEmail: cleanEmail,
-    });
-
-    setActiveEmail(cleanEmail);
-    setIsLoggedIn(true);
-    return { success: true };
-  };
-
   const logout = async () => {
     audioEngine.resetForAccountSwitch();
+    if (cloudUnsubRef.current) {
+      cloudUnsubRef.current();
+      cloudUnsubRef.current = null;
+    }
     if (firebaseUser) {
       await signOutCloud().catch(() => {});
     }
-    setIsLoggedIn(false);
-    localStorage.setItem('tunely_is_logged_in', 'false');
+
+    setFirebaseUser(null);
+    setActiveEmail('');
+    setProfile(null);
+    setLikedSongs([]);
+    setPlaylists([]);
+    setOfflineTracks([]);
+    setHistory([]);
+
+    localStorage.removeItem('tunely_active_email');
+    localStorage.removeItem('tunely_guest_mode');
+    localStorage.setItem('tunely_auth_state', 'unauthenticated');
+
+    setAuthState('unauthenticated');
+    setIsLoginGateOpen(true);
   };
 
-  const switchUser = async (email: string, name?: string) => {
-    const cleanEmail = email.trim().toLowerCase();
-    if (!cleanEmail) return;
-
-    if (cleanEmail === activeEmail && isLoggedIn) {
+  const manualSyncCloudNow = async () => {
+    if (!firebaseUser) {
+      openLoginGate('Sign in with Google to sync your playlists and likes across devices.');
       return;
     }
-
-    // Stop previous account's playing music and clear its queue immediately
-    audioEngine.resetForAccountSwitch();
-
-    if (firebaseUser && firebaseUser.email?.toLowerCase() !== cleanEmail) {
-      await signOutCloud().catch(() => {});
+    setCloudAuthLoading(true);
+    try {
+      const currentLocal = await localDB.getUserPlaylists(activeEmail);
+      for (const pl of currentLocal) {
+        await recoverCloudPlaylist(firebaseUser.uid, pl);
+      }
+      const currentLikes = await localDB.getLikedSongs(activeEmail);
+      for (const song of currentLikes) {
+        await syncCloudLikeSong(firebaseUser.uid, song).catch(() => {});
+      }
+      setCloudError(null);
+    } catch (err: any) {
+      setCloudError('Manual sync failed. Please check internet connection.');
+    } finally {
+      setCloudAuthLoading(false);
     }
-
-    let existing = await localDB.getProfile(cleanEmail);
-    if (!existing) {
-      existing = {
-        email: cleanEmail,
-        name: name || cleanEmail.split('@')[0] || 'Listener',
-        password: 'password123',
-        createdAt: Date.now(),
-        lastActive: Date.now(),
-        preferredQuality: '320kbps',
-        autoResumeOnInterruption: true,
-        soundProfile: 'studio',
-      };
-      await localDB.saveProfile(existing);
-    }
-
-    setActiveEmail(cleanEmail);
-    setIsLoggedIn(true);
   };
 
   const updatePreferredQuality = async (quality: AudioQuality) => {
@@ -528,22 +549,27 @@ export const UserProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
-  const toggleLiked = async (song: Song) => {
+  const toggleLiked = async (song: Song): Promise<boolean> => {
+    if (!canGuestModifyLibrary(isGuest)) {
+      openLoginGate('Sign in with Google to save favorite songs across your devices.');
+      return false;
+    }
+
     const isNowLiked = await localDB.toggleLikedSong(activeEmail, song);
     const updated = await localDB.getLikedSongs(activeEmail);
     setLikedSongs(updated);
 
     if (firebaseUser) {
       if (isNowLiked) {
-        syncCloudLikeSong(firebaseUser.uid, song).catch((e) => console.warn('[Cloud Like Error]', e));
+        syncCloudLikeSong(firebaseUser.uid, song).catch((err) => reportPlaylistSyncError(firebaseUser.uid, err));
       } else {
-        syncCloudUnlikeSong(firebaseUser.uid, song.id).catch((e) => console.warn('[Cloud Unlike Error]', e));
+        syncCloudUnlikeSong(firebaseUser.uid, song.id).catch((err) => reportPlaylistSyncError(firebaseUser.uid, err));
       }
     }
     return isNowLiked;
   };
 
-  const isLiked = (songId: string) => {
+  const isLiked = (songId: string): boolean => {
     return likedSongs.some((s) => s.id === songId);
   };
 
@@ -552,7 +578,7 @@ export const UserProvider: React.FC<{ children: React.ReactNode }> = ({ children
     description?: string,
     coverColor?: string,
     coverUrl?: string
-  ) => {
+  ): Promise<Playlist | null> => {
     return createPlaylistWithSongs(name, [], description, coverColor, coverUrl);
   };
 
@@ -562,7 +588,12 @@ export const UserProvider: React.FC<{ children: React.ReactNode }> = ({ children
     description?: string,
     coverColor?: string,
     coverUrl?: string
-  ) => {
+  ): Promise<Playlist | null> => {
+    if (!canGuestModifyLibrary(isGuest) || !isLoggedIn) {
+      openLoginGate('Sign in with Google to create and sync playlists across your devices.');
+      return null;
+    }
+
     const colors = [
       'from-rose-500 to-red-700',
       'from-amber-500 to-orange-700',
@@ -573,118 +604,237 @@ export const UserProvider: React.FC<{ children: React.ReactNode }> = ({ children
     ];
     const pickedColor = coverColor || colors[Math.floor(Math.random() * colors.length)];
 
-    // Deduplicate imported songs while keeping order
-    const seen = new Set<string>();
-    const uniqueSongs: Song[] = [];
-    for (const s of songs) {
-      if (s?.id && !seen.has(s.id)) {
-        seen.add(s.id);
-        uniqueSongs.push(s);
-      }
-    }
-
     const cleanCoverUrl = coverUrl?.trim() ? coverUrl.trim() : undefined;
 
-    const newPlaylist: Playlist = {
+    const newPlaylist = withPlaylistSongs({
       id: `pl_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       name: name.trim() || 'Imported Playlist',
       description: description?.trim() || '',
       coverColor: pickedColor,
       coverUrl: cleanCoverUrl,
       createdAt: Date.now(),
-      songs: uniqueSongs,
+      songs: [],
       userEmail: activeEmail,
-    };
+    }, songs);
 
-    await localDB.savePlaylist(newPlaylist);
-    setPlaylists((prev) => [newPlaylist, ...prev]);
-
-    if (firebaseUser) {
-      syncCreateCloudPlaylist(firebaseUser.uid, newPlaylist).catch((e) =>
-        console.warn('[Cloud Playlist Error]', e)
-      );
-    }
-    return newPlaylist;
+    return queuePlaylistWork(async () => {
+      if (firebaseUser && auth.currentUser?.uid !== firebaseUser.uid) return null;
+      await localDB.savePlaylist(newPlaylist);
+      if (firebaseUser && auth.currentUser?.uid !== firebaseUser.uid) return null;
+      setPlaylists((prev) => [newPlaylist, ...prev.filter((p) => p.id !== newPlaylist.id)]);
+      if (firebaseUser) {
+        setPendingPlaylistSyncIds((prev) => new Set(prev).add(newPlaylist.id));
+        try {
+          await syncCreateCloudPlaylist(firebaseUser.uid, newPlaylist);
+        } catch (err) {
+          reportPlaylistSyncError(firebaseUser.uid, err);
+        } finally {
+          setPendingPlaylistSyncIds((prev) => {
+            const next = new Set(prev);
+            next.delete(newPlaylist.id);
+            return next;
+          });
+        }
+      }
+      return newPlaylist;
+    });
   };
 
   const updatePlaylist = async (
     playlistId: string,
     updates: { name: string; description?: string; coverColor?: string; coverUrl?: string }
   ): Promise<Playlist | null> => {
-    const existing = playlists.find((p) => p.id === playlistId);
-    if (!existing) return null;
+    if (!canGuestModifyLibrary(isGuest)) {
+      openLoginGate('Sign in with Google to edit playlists.');
+      return null;
+    }
 
-    const nextName = updates.name.trim() || existing.name;
-    const nextDescription =
-      updates.description !== undefined ? updates.description.trim() : existing.description || '';
-    const nextColor = updates.coverColor || existing.coverColor || 'from-violet-600 to-indigo-700';
-    const nextCoverUrl =
-      updates.coverUrl !== undefined
-        ? updates.coverUrl.trim() || undefined
-        : existing.coverUrl;
+    return queuePlaylistWork(async () => {
+      if (firebaseUser && auth.currentUser?.uid !== firebaseUser.uid) return null;
+      const existing = await localDB.getPlaylist(playlistId);
+      if (!existing || existing.userEmail !== activeEmail) return null;
 
-    const updated: Playlist = {
-      ...existing,
-      name: nextName,
-      description: nextDescription,
-      coverColor: nextColor,
-      coverUrl: nextCoverUrl,
-    };
+      const nextName = updates.name.trim() || existing.name;
+      const nextDescription =
+        updates.description !== undefined ? updates.description.trim() : existing.description || '';
+      const nextColor = updates.coverColor || existing.coverColor || 'from-violet-600 to-indigo-700';
+      const nextCoverUrl =
+        updates.coverUrl !== undefined ? updates.coverUrl.trim() || undefined : existing.coverUrl;
+      const nextRevision = (existing.revision ?? 0) + 1;
+      const nextUpdatedAt = Math.max(Date.now(), (existing.updatedAt ?? 0) + 1);
 
-    await localDB.savePlaylist(updated);
-    setPlaylists((prev) => prev.map((p) => (p.id === playlistId ? updated : p)));
+      const updated: Playlist = {
+        ...existing,
+        name: nextName,
+        description: nextDescription,
+        coverColor: nextColor,
+        coverUrl: nextCoverUrl,
+        updatedAt: nextUpdatedAt,
+        revision: nextRevision,
+      };
 
-    if (firebaseUser) {
-      syncUpdateCloudPlaylistDetails(firebaseUser.uid, updated).catch((e) =>
-        console.warn('[Cloud Playlist Rename Error]', e)
+      updated.songs = sanitizePlaylistImportTracks(updated.songs);
+      await localDB.savePlaylist(updated);
+      if (firebaseUser && auth.currentUser?.uid !== firebaseUser.uid) return null;
+      setPlaylists((prev) => prev.map((p) => (p.id === playlistId ? updated : p)));
+
+      if (firebaseUser) {
+        setPendingPlaylistSyncIds((prev) => new Set(prev).add(playlistId));
+        try {
+          await syncUpdateCloudPlaylistDetails(firebaseUser.uid, updated);
+        } catch (err) {
+          reportPlaylistSyncError(firebaseUser.uid, err);
+        } finally {
+          setPendingPlaylistSyncIds((prev) => {
+            const next = new Set(prev);
+            next.delete(playlistId);
+            return next;
+          });
+        }
+      }
+      return updated;
+    });
+  };
+
+  const deletePlaylist = async (playlistId: string): Promise<void> => {
+    if (!canGuestModifyLibrary(isGuest)) {
+      openLoginGate('Sign in with Google to manage playlists.');
+      return;
+    }
+
+    await queuePlaylistWork(async () => {
+      if (firebaseUser && auth.currentUser?.uid !== firebaseUser.uid) return;
+      const playlist = await localDB.getPlaylist(playlistId);
+      if (!playlist || playlist.userEmail !== activeEmail) return;
+      await localDB.deletePlaylist(playlistId);
+      if (firebaseUser && auth.currentUser?.uid !== firebaseUser.uid) return;
+      setPlaylists((prev) => prev.filter((p) => p.id !== playlistId));
+      if (firebaseUser) {
+        setPendingPlaylistSyncIds((prev) => new Set(prev).add(playlistId));
+        try {
+          await syncDeleteCloudPlaylist(firebaseUser.uid, playlistId);
+        } catch (err) {
+          reportPlaylistSyncError(firebaseUser.uid, err);
+        } finally {
+          setPendingPlaylistSyncIds((prev) => {
+            const next = new Set(prev);
+            next.delete(playlistId);
+            return next;
+          });
+        }
+      }
+    });
+  };
+
+  const mutatePlaylistSongs = async (
+    playlistId: string,
+    editSongs: (songs: Song[]) => Song[],
+    options?: { addedSongIds?: string[]; deletedSongIds?: string[] }
+  ): Promise<{ success: boolean; synced: boolean; error?: string }> => {
+    if (!canGuestModifyLibrary(isGuest)) {
+      openLoginGate('Sign in with Google to manage playlists.');
+      return { success: false, synced: false, error: 'Sign in with Google to manage playlists.' };
+    }
+
+    let result: { success: boolean; synced: boolean; error?: string } = { success: true, synced: true };
+
+    await queuePlaylistWork(async () => {
+      if (firebaseUser && auth.currentUser?.uid !== firebaseUser.uid) {
+        result = { success: false, synced: false, error: 'User session mismatch' };
+        return;
+      }
+      const playlist = await localDB.getPlaylist(playlistId);
+      if (!playlist || playlist.userEmail !== activeEmail) {
+        result = { success: false, synced: false, error: 'Playlist not found' };
+        return;
+      }
+      const songs = editSongs(playlist.songs);
+      if (songs === playlist.songs) {
+        result = { success: true, synced: true };
+        return;
+      }
+
+      const addedSongIds =
+        options?.addedSongIds ??
+        songs.filter((s) => !playlist.songs.some((p) => p.id === s.id)).map((s) => s.id);
+      const deletedSongIds =
+        options?.deletedSongIds ??
+        playlist.songs.filter((p) => !songs.some((s) => s.id === p.id)).map((p) => p.id);
+
+      const updated = withPlaylistSongs(
+        playlist,
+        songs,
+        Math.max(Date.now(), (playlist.updatedAt ?? 0) + 1)
       );
-    }
-    return updated;
+      await localDB.savePlaylist(updated);
+      if (firebaseUser && auth.currentUser?.uid !== firebaseUser.uid) {
+        result = { success: false, synced: false, error: 'User session mismatch' };
+        return;
+      }
+      setPlaylists((prev) => prev.map((item) => (item.id === playlistId ? updated : item)));
+      if (firebaseUser) {
+        setPendingPlaylistSyncIds((prev) => new Set(prev).add(playlistId));
+        try {
+          await syncUpdateCloudPlaylistSongs(firebaseUser.uid, updated, {
+            addedSongIds,
+            deletedSongIds,
+          });
+          result = { success: true, synced: true };
+        } catch (err) {
+          const syncErrorMsg = formatFirestoreSyncError(err);
+          reportPlaylistSyncError(firebaseUser.uid, err);
+          result = { success: true, synced: false, error: syncErrorMsg };
+        } finally {
+          setPendingPlaylistSyncIds((prev) => {
+            const next = new Set(prev);
+            next.delete(playlistId);
+            return next;
+          });
+        }
+      } else {
+        result = { success: true, synced: true };
+      }
+    });
+
+    return result;
   };
 
-  const deletePlaylist = async (playlistId: string) => {
-    await localDB.deletePlaylist(playlistId);
-    setPlaylists((prev) => prev.filter((p) => p.id !== playlistId));
+  const addSongToPlaylist = (playlistId: string, song: Song): Promise<{ success: boolean; synced: boolean; error?: string }> =>
+    mutatePlaylistSongs(
+      playlistId,
+      (songs) => {
+        if (songs.some((item) => item.id === song.id)) return songs;
+        if (songs.length >= 450) {
+          setCloudError('This playlist already contains 450 tracks.');
+          return songs;
+        }
+        return [...songs, song];
+      },
+      { addedSongIds: [song.id] }
+    );
 
-    if (firebaseUser) {
-      syncDeleteCloudPlaylist(firebaseUser.uid, playlistId).catch((e) => console.warn('[Cloud Delete Error]', e));
-    }
-  };
+  const removeSongFromPlaylist = (playlistId: string, songId: string): Promise<{ success: boolean; synced: boolean; error?: string }> =>
+    mutatePlaylistSongs(
+      playlistId,
+      (songs) =>
+        songs.some((song) => song.id === songId)
+          ? songs.filter((song) => song.id !== songId)
+          : songs,
+      { deletedSongIds: [songId] }
+    );
 
-  const addSongToPlaylist = async (playlistId: string, song: Song) => {
-    const pl = playlists.find((p) => p.id === playlistId);
-    if (!pl) return;
-    if (pl.songs.some((s) => s.id === song.id)) return;
+  const reorderPlaylistSongs = (playlistId: string, songId: string, direction: -1 | 1): Promise<{ success: boolean; synced: boolean; error?: string }> =>
+    mutatePlaylistSongs(playlistId, (songs) => {
+      const index = songs.findIndex((song) => song.id === songId);
+      const target = index + direction;
+      if (index < 0 || target < 0 || target >= songs.length) return songs;
+      const reordered = [...songs];
+      const [moved] = reordered.splice(index, 1);
+      reordered.splice(target, 0, moved);
+      return reordered;
+    });
 
-    const updated: Playlist = {
-      ...pl,
-      songs: [...pl.songs, song],
-    };
-    await localDB.savePlaylist(updated);
-    setPlaylists((prev) => prev.map((p) => (p.id === playlistId ? updated : p)));
-
-    if (firebaseUser) {
-      syncUpdateCloudPlaylistSongs(firebaseUser.uid, updated).catch((e) => console.warn('[Cloud Update Error]', e));
-    }
-  };
-
-  const removeSongFromPlaylist = async (playlistId: string, songId: string) => {
-    const pl = playlists.find((p) => p.id === playlistId);
-    if (!pl) return;
-
-    const updated: Playlist = {
-      ...pl,
-      songs: pl.songs.filter((s) => s.id !== songId),
-    };
-    await localDB.savePlaylist(updated);
-    setPlaylists((prev) => prev.map((p) => (p.id === playlistId ? updated : p)));
-
-    if (firebaseUser) {
-      syncUpdateCloudPlaylistSongs(firebaseUser.uid, updated).catch((e) => console.warn('[Cloud Remove Error]', e));
-    }
-  };
-
-  const downloadSongForOffline = async (song: Song) => {
+  const downloadSongForOffline = async (song: Song): Promise<void> => {
     if (downloadingSongIds[song.id] !== undefined) return;
 
     setDownloadingSongIds((prev) => ({ ...prev, [song.id]: 0 }));
@@ -707,7 +857,12 @@ export const UserProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setDownloadingSongIds((prev) => ({ ...prev, [song.id]: pct }));
       });
 
-      const downloaded = await localDB.saveOfflineTrack(targetSong, blob, preferred, activeEmail);
+      const downloaded = await localDB.saveOfflineTrack(
+        targetSong,
+        blob,
+        preferred,
+        activeEmail || 'guest@tunely.local'
+      );
       audioEngine.markOfflineTrack(song.id, true);
       setOfflineTracks((prev) => [downloaded, ...prev.filter((t) => t.id !== song.id)]);
     } catch (err) {
@@ -721,13 +876,13 @@ export const UserProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
-  const deleteOfflineTrack = async (songId: string) => {
+  const deleteOfflineTrack = async (songId: string): Promise<void> => {
     await localDB.deleteOfflineTrack(songId);
     audioEngine.markOfflineTrack(songId, false);
     setOfflineTracks((prev) => prev.filter((t) => t.id !== songId));
   };
 
-  const clearAllDownloads = async () => {
+  const clearAllDownloads = async (): Promise<void> => {
     await localDB.clearAllOfflineTracks();
     audioEngine.refreshOfflineCacheIndex().catch(() => {});
     setOfflineTracks([]);
@@ -741,23 +896,34 @@ export const UserProvider: React.FC<{ children: React.ReactNode }> = ({ children
     <UserContext.Provider
       value={{
         activeEmail,
+        authState,
+        isGuest,
         isLoggedIn,
-        isCloudSynced: !!firebaseUser,
+        isCloudSynced,
         cloudAuthLoading,
         cloudError,
         profile,
-        profilesList,
+        profilesList: profile ? [profile] : [],
         likedSongs,
         playlists,
         offlineTracks,
         history,
         isOfflineModeOnly,
         downloadingSongIds,
-        login,
-        signup,
+        guestUsage,
+        isLoginGateOpen,
+        loginGateReason,
+        openLoginGate,
+        closeLoginGate,
+        continueAsGuest,
         loginWithGoogle,
         logout,
-        switchUser,
+        manualSyncCloudNow,
+        checkGuestSearchAllowed,
+        recordGuestSearch,
+        checkGuestPlaybackAllowed,
+        recordGuestPlaybackSeconds,
+        recordGuestTrackFinished: recordGuestTrackFinishedAction,
         updatePreferredQuality,
         updateSoundProfile,
         updateAutoResume,
@@ -769,11 +935,14 @@ export const UserProvider: React.FC<{ children: React.ReactNode }> = ({ children
         deletePlaylist,
         addSongToPlaylist,
         removeSongFromPlaylist,
+        reorderPlaylistSongs,
         downloadSongForOffline,
         deleteOfflineTrack,
         clearAllDownloads,
         toggleOfflineModeOnly,
         refreshUserData,
+        isCloudSyncing: pendingPlaylistSyncIds.size > 0,
+        pendingPlaylistSyncIds,
       }}
     >
       {children}

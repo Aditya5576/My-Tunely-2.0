@@ -1,8 +1,10 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Search, X, Loader2, Music } from 'lucide-react';
+import { Search, X, Loader2, Music, Sparkles } from 'lucide-react';
 import { Song } from '../types/music';
 import { musicAPI } from '../services/api';
 import { SongRow } from '../components/SongRow';
+import { useUser } from '../context/UserContext';
+import { GUEST_SEARCH_LIMIT } from '../utils/guestLimits';
 
 interface SearchViewProps {
   initialQuery?: string;
@@ -24,6 +26,7 @@ export const SearchView: React.FC<SearchViewProps> = ({
   initialQuery = '',
   onOpenPlaylistModal,
 }) => {
+  const { isGuest, guestUsage, checkGuestSearchAllowed, recordGuestSearch, openLoginGate } = useUser();
   const [query, setQuery] = useState(initialQuery);
   const [songs, setSongs] = useState<Song[]>([]);
   const [loading, setLoading] = useState(false);
@@ -70,10 +73,15 @@ export const SearchView: React.FC<SearchViewProps> = ({
       abortControllerRef.current = null;
     }
 
-    if (!trimmed) {
+    if (!trimmed || trimmed.length < 2) {
       setSongs([]);
       setLoading(false);
       setSearchError(null);
+      return;
+    }
+
+    if (isGuest && !checkGuestSearchAllowed()) {
+      setLoading(false);
       return;
     }
 
@@ -89,6 +97,9 @@ export const SearchView: React.FC<SearchViewProps> = ({
         setSongs(results || []);
         if (results && results.length > 0) {
           saveRecentSearch(trimmed);
+          if (isGuest) {
+            recordGuestSearch();
+          }
         }
       }
     } catch (err: any) {
@@ -110,7 +121,7 @@ export const SearchView: React.FC<SearchViewProps> = ({
 
     if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
 
-    if (!val.trim()) {
+    if (!val.trim() || val.trim().length < 2) {
       if (abortControllerRef.current) abortControllerRef.current.abort();
       setSongs([]);
       setLoading(false);
@@ -195,6 +206,24 @@ export const SearchView: React.FC<SearchViewProps> = ({
           ) : null}
         </form>
       </div>
+
+      {/* Guest Mode Search Quota Banner */}
+      {isGuest && (
+        <div className="flex items-center justify-between p-2.5 rounded-2xl bg-amber-500/10 border border-amber-500/25 text-xs text-amber-500 dark:text-amber-300">
+          <div className="flex items-center gap-2 min-w-0">
+            <Sparkles className="w-3.5 h-3.5 shrink-0" />
+            <span className="truncate">
+              Guest search quota: <strong>{guestUsage.searchesCount}</strong> / {GUEST_SEARCH_LIMIT} used
+            </span>
+          </div>
+          <button
+            onClick={() => openLoginGate('Sign in with Google for unlimited song searches.')}
+            className="text-[11px] font-bold underline cursor-pointer hover:opacity-80 shrink-0 ml-2"
+          >
+            Unlock Unlimited
+          </button>
+        </div>
+      )}
 
       {/* Smooth 60fps Loading Skeletons */}
       {loading && (

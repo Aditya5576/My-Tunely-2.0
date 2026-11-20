@@ -55,6 +55,10 @@ export const PlaylistModal: React.FC<PlaylistModalProps> = ({
     createPlaylistWithSongs,
     updatePlaylist,
     addSongToPlaylist,
+    isGuest,
+    isLoggedIn,
+    openLoginGate,
+    pendingPlaylistSyncIds,
   } = useUser();
 
   const [mode, setMode] = useState<'list' | 'create' | 'import' | 'edit'>('list');
@@ -64,6 +68,8 @@ export const PlaylistModal: React.FC<PlaylistModalProps> = ({
   const [coverUrl, setCoverUrl] = useState('');
   const [coverError, setCoverError] = useState<string | null>(null);
   const [addedPlaylistId, setAddedPlaylistId] = useState<string | null>(null);
+  const [addingToPlaylistId, setAddingToPlaylistId] = useState<string | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Import state
@@ -102,6 +108,7 @@ export const PlaylistModal: React.FC<PlaylistModalProps> = ({
       }
       setAddedPlaylistId(null);
       setCoverError(null);
+      setSyncError(null);
       setImportError(null);
       setImportSuccess(null);
     } else {
@@ -109,6 +116,7 @@ export const PlaylistModal: React.FC<PlaylistModalProps> = ({
       setDescription('');
       setCoverUrl('');
       setCoverError(null);
+      setSyncError(null);
       setMode('list');
       setImportUrl('');
       setImportRawText('');
@@ -159,10 +167,15 @@ export const PlaylistModal: React.FC<PlaylistModalProps> = ({
       return;
     }
 
-    const created = await createPlaylist(name, description, selectedColor, trimmedCover || undefined);
-    if (songToAdd) {
-      await addSongToPlaylist(created.id, songToAdd);
-    }
+    const initialSongs = songToAdd ? [songToAdd] : [];
+    const created = await createPlaylistWithSongs(
+      name,
+      initialSongs,
+      description,
+      selectedColor,
+      trimmedCover || undefined
+    );
+    if (!created) return;
     setName('');
     setDescription('');
     setCoverUrl('');
@@ -170,13 +183,26 @@ export const PlaylistModal: React.FC<PlaylistModalProps> = ({
   };
 
   const handleAddToExisting = async (playlistId: string) => {
-    if (!songToAdd) return;
-    await addSongToPlaylist(playlistId, songToAdd);
-    setAddedPlaylistId(playlistId);
-    setTimeout(() => {
-      setAddedPlaylistId(null);
-      onClose();
-    }, 550);
+    if (!songToAdd || addingToPlaylistId) return;
+    setSyncError(null);
+    setAddingToPlaylistId(playlistId);
+    try {
+      const res = await addSongToPlaylist(playlistId, songToAdd);
+      if (res && !res.synced && res.error) {
+        setSyncError(res.error);
+        return;
+      }
+      setAddedPlaylistId(playlistId);
+      setTimeout(() => {
+        setAddedPlaylistId(null);
+        onClose();
+      }, 550);
+    } catch (err: any) {
+      console.warn('[Tunely] Add to playlist failed:', err);
+      setSyncError(err?.message || 'Failed to add song to playlist.');
+    } finally {
+      setAddingToPlaylistId(null);
+    }
   };
 
   const handleStartImport = async (e: React.FormEvent) => {
@@ -184,12 +210,17 @@ export const PlaylistModal: React.FC<PlaylistModalProps> = ({
     setImportError(null);
     setImportSuccess(null);
 
+    if (!isLoggedIn || isGuest) {
+      openLoginGate('Sign in with Google to import and sync playlists across your devices.');
+      return;
+    }
+
     if (importInputType === 'link' && !importUrl.trim()) {
       setImportError('Paste a public Spotify, YouTube, Apple Music, or JioSaavn playlist URL.');
       return;
     }
     if (importInputType === 'text' && !importRawText.trim()) {
-      setImportError('Paste one or more song lines (e.g. "Kesariya - Arijit Singh").');
+      setImportError('Paste one or more song lines (e.g. "Arijit Singh - Kesariya").');
       return;
     }
 
@@ -210,7 +241,9 @@ export const PlaylistModal: React.FC<PlaylistModalProps> = ({
 
       if (result.songs.length === 0) {
         throw new Error(
-          'Tracks were found, but none could be matched cleanly. Try a different playlist link.'
+          importInputType === 'text'
+            ? 'No tracks matched. Check each artist and song title and try again.'
+            : 'Tracks were found, but none could be matched cleanly. Try a different playlist link.'
         );
       }
 
@@ -223,12 +256,20 @@ export const PlaylistModal: React.FC<PlaylistModalProps> = ({
         selectedColor
       );
 
+      if (!saved || !saved.songs || saved.songs.length === 0) {
+        throw new Error('Failed to save imported tracks to library. Please try again.');
+      }
+
       setImportSuccess({
         playlistId: saved.id,
-        result: { ...result, playlistName: saved.name },
+        result: {
+          ...result,
+          playlistName: saved.name,
+          matchedCount: saved.songs.length,
+        },
       });
-    } catch (err: any) {
-      setImportError(err?.message || 'Failed to import playlist. Verify the link is public.');
+    } catch (err: unknown) {
+      setImportError(err instanceof Error ? err.message : 'Failed to import playlist. Please try again.');
     } finally {
       setIsImporting(false);
     }
@@ -385,6 +426,25 @@ export const PlaylistModal: React.FC<PlaylistModalProps> = ({
               </div>
             ) : (
               <form onSubmit={handleStartImport} className="space-y-4">
+                {(!isLoggedIn || isGuest) && (
+                  <div className="p-3.5 rounded-2xl bg-amber-500/10 border border-amber-500/25 flex items-start gap-2.5">
+                    <AlertCircle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
+                    <div className="flex-1 text-xs space-y-1">
+                      <p className="font-bold text-[var(--text-primary)]">Google Sign-in Required</p>
+                      <p className="text-[var(--text-secondary)] leading-relaxed">
+                        Sign in to save imported playlists to your library and sync them across all your devices.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => openLoginGate('Sign in with Google to import playlists.')}
+                        className="font-bold text-indigo-500 hover:text-indigo-400 underline underline-offset-2 inline-block cursor-pointer"
+                      >
+                        Sign in with Google &rarr;
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 {/* Toggle between URL vs Pasted List/CSV */}
                 <div className="flex items-center gap-2">
                   <button
@@ -452,11 +512,11 @@ export const PlaylistModal: React.FC<PlaylistModalProps> = ({
                       value={importRawText}
                       onChange={(e) => setImportRawText(e.target.value)}
                       disabled={isImporting}
-                      placeholder={`Kesariya - Arijit Singh\nBlinding Lights - The Weeknd\nTum Hi Ho - Arijit Singh\n...`}
+                      placeholder={`Arijit Singh - Kesariya\nThe Weeknd - Blinding Lights\nArijit Singh - Tum Hi Ho\n...`}
                       className="w-full px-3.5 py-2.5 rounded-xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] text-[var(--text-primary)] placeholder-[var(--text-muted)] text-base sm:text-xs font-mono leading-relaxed focus:outline-none focus:border-[var(--accent-primary)] disabled:opacity-60"
                     />
                     <p className="text-[11px] text-[var(--text-secondary)]">
-                      One song per line (&ldquo;Song - Artist&rdquo;) or CSV export (&ldquo;Song, Artist&rdquo;).
+                      One song per line (&ldquo;Artist - Song&rdquo;) or CSV export (&ldquo;Song, Artist&rdquo;).
                     </p>
                   </div>
                 )}
@@ -555,7 +615,7 @@ export const PlaylistModal: React.FC<PlaylistModalProps> = ({
                     ) : (
                       <>
                         <Sparkles className="w-4 h-4" />
-                        <span>Import Songs</span>
+                        <span>{importInputType === 'text' ? 'Import Tracks' : 'Import Songs'}</span>
                       </>
                     )}
                   </button>
@@ -728,6 +788,15 @@ export const PlaylistModal: React.FC<PlaylistModalProps> = ({
         {/* VIEW 3: EXISTING PLAYLIST PICKER */}
         {mode === 'list' && (
           <div className="my-2 space-y-2.5">
+            {syncError && (
+              <div className="p-3 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex items-start gap-2.5 text-xs text-amber-500">
+                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                <div className="flex-1">
+                  <p className="font-bold">Sync Notice</p>
+                  <p className="text-[var(--text-secondary)] leading-relaxed">{syncError}</p>
+                </div>
+              </div>
+            )}
             <div className="grid grid-cols-2 gap-2">
               <button
                 onClick={() => setMode('create')}
@@ -752,17 +821,23 @@ export const PlaylistModal: React.FC<PlaylistModalProps> = ({
                   ? pl.songs.some((s) => s.id === songToAdd.id)
                   : false;
                 const isJustAdded = addedPlaylistId === pl.id;
+                const isSyncing =
+                  addingToPlaylistId === pl.id ||
+                  (Boolean(pendingPlaylistSyncIds?.has(pl.id)) && !isJustAdded);
+                const playlistIsFull = pl.songs.length >= 450;
 
                 return (
                   <button
                     key={pl.id}
-                    disabled={alreadyContains || !songToAdd}
+                    disabled={alreadyContains || playlistIsFull || !songToAdd || isSyncing}
                     onClick={() => handleAddToExisting(pl.id)}
                     className={`w-full min-h-[56px] p-3 rounded-2xl border text-left flex items-center justify-between transition cursor-pointer active:scale-98 ${
-                      alreadyContains
+                      alreadyContains || playlistIsFull
                         ? 'bg-[var(--bg-surface)] border-[var(--border-subtle)] opacity-60 cursor-not-allowed'
                         : isJustAdded
                         ? 'bg-emerald-600/15 border-emerald-500 text-emerald-500'
+                        : isSyncing
+                        ? 'bg-violet-600/10 border-violet-500/50 text-violet-400 cursor-wait'
                         : !songToAdd
                         ? 'bg-[var(--bg-surface)] border-[var(--border-subtle)] opacity-75 cursor-default'
                         : 'bg-[var(--bg-surface)] border-[var(--border-subtle)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-surface-hover)]'
@@ -790,12 +865,16 @@ export const PlaylistModal: React.FC<PlaylistModalProps> = ({
                           {pl.name}
                         </p>
                         <p className="text-xs text-[var(--text-secondary)] truncate leading-normal">
-                          {pl.songs.length} tracks
+                          {pl.songs.length} tracks{playlistIsFull ? " (full)" : ""}
                         </p>
                       </div>
                     </div>
 
-                    {isJustAdded ? (
+                    {isSyncing ? (
+                      <span className="text-xs font-semibold text-violet-400 flex items-center gap-1.5 shrink-0">
+                        <Loader2 className="w-4 h-4 animate-spin" /> Syncing...
+                      </span>
+                    ) : isJustAdded ? (
                       <span className="text-xs font-semibold text-emerald-500 flex items-center gap-1 shrink-0">
                         <Check className="w-4 h-4" /> Added
                       </span>

@@ -22,10 +22,10 @@ export const Header: React.FC<HeaderProps> = ({
   return (
     <header className="shrink-0 z-30 w-full bg-[var(--bg-elevated)] px-3.5 sm:px-5 safe-header-pad pb-2.5 flex items-center justify-between gap-2 border-b border-[var(--border-subtle)] transition-colors duration-200">
       {/* Brand Lockup */}
-      <div className="flex items-center gap-2 sm:gap-2.5 min-h-[44px] min-w-0 whitespace-nowrap shrink-0 select-none group">
+      <div className="flex items-center gap-1.5 sm:gap-2.5 min-h-[44px] min-w-0 whitespace-nowrap shrink select-none group">
         {/* Clean Proportional Logo Mark */}
         <div
-          className="relative flex items-center justify-center w-[48px] h-[28px] sm:w-[54px] sm:h-[32px] shrink-0"
+          className="relative flex items-center justify-center w-[44px] h-[26px] sm:w-[54px] sm:h-[32px] shrink-0"
           aria-hidden="true"
         >
           <img
@@ -38,10 +38,10 @@ export const Header: React.FC<HeaderProps> = ({
 
         {/* Sculpted Wordmark + Gradient Edition Superscript */}
         <div className="flex items-start gap-1 leading-none min-w-0">
-          <span className="font-display font-extrabold text-[21px] sm:text-[22px] text-[var(--text-primary)] tracking-[-0.045em] leading-none">
+          <span className="font-display font-extrabold text-[20px] sm:text-[22px] text-[var(--text-primary)] tracking-[-0.045em] leading-none">
             Tunely
           </span>
-          <span className="font-mono text-[10px] sm:text-[10.5px] font-extrabold tracking-[0.04em] leading-none pt-[1px] bg-gradient-to-r from-pink-500 via-indigo-400 to-cyan-400 bg-clip-text text-transparent">
+          <span className="hidden sm:inline-block font-mono text-[10px] sm:text-[10.5px] font-extrabold tracking-[0.04em] leading-none pt-[1px] bg-gradient-to-r from-pink-500 via-indigo-400 to-cyan-400 bg-clip-text text-transparent">
             2.0
           </span>
         </div>

@@ -319,8 +319,44 @@ function cloudPlaylistSongs(playlist: Playlist): Record<string, unknown>[] {
   return sanitizePlaylistImportTracks(playlist.songs).slice(0, 450).map(sanitizeSongForCloud);
 }
 
+export const FIRESTORE_DOC_MAX_BYTES = 1000000; // ~1MB safe ceiling (hard limit 1,048,576)
+
+/**
+ * Calculates estimated UTF-8 byte size of a Firestore document payload
+ */
+export function estimateFirestoreDocSize(data: unknown): number {
+  if (data === null || data === undefined) return 0;
+  if (typeof data === 'boolean') return 1;
+  if (typeof data === 'number') return 8;
+  if (typeof data === 'string') {
+    let bytes = 0;
+    for (let i = 0; i < data.length; i++) {
+      const code = data.charCodeAt(i);
+      if (code < 0x80) bytes += 1;
+      else if (code < 0x800) bytes += 2;
+      else if (code < 0xd800 || code >= 0xe000) bytes += 3;
+      else {
+        i++;
+        bytes += 4;
+      }
+    }
+    return bytes;
+  }
+  if (Array.isArray(data)) {
+    return data.reduce((acc, item) => acc + estimateFirestoreDocSize(item), 0);
+  }
+  if (typeof data === 'object') {
+    let size = 0;
+    for (const [key, val] of Object.entries(data)) {
+      size += estimateFirestoreDocSize(key) + estimateFirestoreDocSize(val);
+    }
+    return size;
+  }
+  return 0;
+}
+
 function newCloudPlaylist(uid: string, id: string, playlist: Playlist) {
-  return {
+  const payload = {
     id,
     ownerId: uid,
     ...cloudPlaylistDetails(playlist),
@@ -329,6 +365,13 @@ function newCloudPlaylist(uid: string, id: string, playlist: Playlist) {
     updatedAt: serverTimestamp(),
     revision: playlist.revision ?? 1,
   };
+  const size = estimateFirestoreDocSize(payload);
+  if (size > FIRESTORE_DOC_MAX_BYTES) {
+    const err = new Error('Playlist size exceeds Firestore 1MB limit. Saved locally to device.');
+    (err as any).code = 'PLAYLIST_SIZE_LIMIT_EXCEEDED';
+    throw err;
+  }
+  return payload;
 }
 
 export async function syncCreateCloudPlaylist(uid: string, playlist: Playlist): Promise<void> {
@@ -406,13 +449,24 @@ async function mergeCloudPlaylist(
         writeFields.songs = cloudPlaylistSongs({ ...sanitizedPlaylist, songs: reconciled });
       }
 
-      transaction.set(ref, {
+      const updatePayload = {
         ...writeFields,
         revision: nextRevision,
         updatedAt: serverTimestamp(),
-      }, { merge: true });
+      };
+      const updateSize = estimateFirestoreDocSize(updatePayload);
+      if (updateSize > FIRESTORE_DOC_MAX_BYTES) {
+        const err = new Error('Playlist size exceeds Firestore 1MB limit. Saved locally to device.');
+        (err as any).code = 'PLAYLIST_SIZE_LIMIT_EXCEEDED';
+        throw err;
+      }
+
+      transaction.set(ref, updatePayload, { merge: true });
     });
   } catch (error) {
+    if ((error as { code?: string })?.code === 'PLAYLIST_SIZE_LIMIT_EXCEEDED') {
+      throw error;
+    }
     try {
       const code = (error as { code?: string })?.code;
       if (sanitizedPlaylist.cloudConfirmed || (code !== 'permission-denied' && code !== 'not-found')) {

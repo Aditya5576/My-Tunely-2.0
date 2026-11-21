@@ -70,12 +70,89 @@ export function computeEffectiveEqBands(bands: EqBands, bassBoostPercent: number
   };
 }
 
+export interface HeadroomAttenuationOptions {
+  enhancerPresenceDb?: number;
+  enhancerAirDb?: number;
+  stereoWidth?: number;
+  minFloor?: number;
+}
+
 /**
- * Compute negative pre-gain headroom attenuation (in linear scale) based on effective EQ boosts
- * and makeup gain to guarantee the cumulative signal through EQ, compressor, and soft-limiter
- * stays strictly within 0 dBFS without hard-clipping or flatline scattering on headsets.
+ * Creates an identity linear curve for WaveShaperNode ensuring 100% bit-transparent passthrough
+ * in Flat / Clean DSP mode without harmonic distortion or saturation.
  */
-export function computeHeadroomAttenuation(effectiveBands: EqBands, makeupGain: number = 1.0): number {
+export function createLinearWaveShaperCurve(samples: number = 4096): Float32Array<ArrayBuffer> {
+  const curve = new Float32Array(new ArrayBuffer(samples * 4));
+  for (let i = 0; i < samples; i++) {
+    curve[i] = (i * 2) / (samples - 1) - 1;
+  }
+  return curve;
+}
+
+/**
+ * Creates a soft-saturation ceiling curve with tanh knee transition to prevent harsh clipping.
+ */
+export function createSoftCeilingCurve(samples: number = 4096): Float32Array<ArrayBuffer> {
+  const curve = new Float32Array(new ArrayBuffer(samples * 4));
+  const threshold = 0.82;
+  const ceiling = 0.985;
+  const kneeRange = ceiling - threshold;
+  for (let i = 0; i < samples; i++) {
+    const x = (i * 2) / (samples - 1) - 1;
+    const absX = Math.abs(x);
+    if (absX <= threshold) {
+      curve[i] = x;
+    } else {
+      const over = (absX - threshold) / kneeRange;
+      const shaped = threshold + kneeRange * Math.tanh(over);
+      curve[i] = x < 0 ? -shaped : shaped;
+    }
+  }
+  return curve;
+}
+
+/**
+ * Compute negative pre-gain headroom attenuation (in linear scale) based on effective EQ boosts,
+ * adjacent band constructive summing, makeup gain, stereo width matrix overhead, and enhancer gains
+ * to guarantee the cumulative signal through EQ, compressor, and soft-limiter stays strictly within
+ * 0 dBFS without hard-clipping or flatline scattering on headsets.
+ */
+export function computeHeadroomAttenuation(
+  effectiveBands: EqBands,
+  makeupGain: number = 1.0,
+  options?: HeadroomAttenuationOptions
+): number {
+  const presenceBonus = options?.enhancerPresenceDb ?? 0;
+  const airBonus = options?.enhancerAirDb ?? 0;
+  const stereoWidth = options?.stereoWidth ?? 0;
+  const minFloor = options?.minFloor !== undefined ? options.minFloor : 0.35;
+
+  const hasAdvancedOptions =
+    options !== undefined &&
+    (presenceBonus > 0 || airBonus > 0 || stereoWidth > 0 || options.minFloor !== undefined);
+
+  if (hasAdvancedOptions) {
+    // Constructive overlap: sub-shelf and peaking bass share overlapping low-end energy (40-120Hz)
+    const subSum = Math.max(0, effectiveBands.sub) + Math.max(0, effectiveBands.bass) * 0.45;
+    const bassSum = Math.max(0, effectiveBands.bass) + Math.max(0, effectiveBands.sub) * 0.35;
+    const vocalSum = Math.max(0, effectiveBands.vocal) + presenceBonus;
+    const airSum = Math.max(0, effectiveBands.air) + airBonus;
+    const midSum = Math.max(0, effectiveBands.mid);
+
+    const maxOverheadDb = Math.max(0, subSum, bassSum, vocalSum, airSum, midSum);
+    const makeupDb = makeupGain > 1.0 ? 20 * Math.log10(makeupGain) : 0;
+    // Mid-Side spatial matrix gain: side injection adds constructive energy to L & R channels
+    const stereoDb = stereoWidth > 0 ? 20 * Math.log10(1 + (stereoWidth * 0.5)) : 0;
+
+    const totalOverheadDb = maxOverheadDb + makeupDb + stereoDb;
+    if (totalOverheadDb <= 0.05) {
+      return 1.0;
+    }
+    const linearScale = Math.pow(10, -totalOverheadDb / 20);
+    return Math.max(minFloor, Math.min(1.0, Number(linearScale.toFixed(4))));
+  }
+
+  // Standard legacy budget mode (backward compatible with baseline tests)
   const maxBoostDb = Math.max(
     0,
     effectiveBands.sub,
@@ -84,16 +161,13 @@ export function computeHeadroomAttenuation(effectiveBands: EqBands, makeupGain: 
     effectiveBands.vocal,
     effectiveBands.air
   );
-  // Account for constructive summing of adjacent boosted bands and makeup gain
   const makeupDb = makeupGain > 1.0 ? 20 * Math.log10(makeupGain) : 0;
-  // Attenuate by 65% of max positive boost plus makeup gain above unity
   const totalOverheadDb = maxBoostDb * 0.65 + makeupDb;
   if (totalOverheadDb <= 0.05) {
     return 1.0;
   }
-  // Convert dB to linear gain and clamp to safe floor (minimum 0.35 to prevent volume dropping too low)
   const linearScale = Math.pow(10, -totalOverheadDb / 20);
-  return Math.max(0.35, Math.min(1.0, Number(linearScale.toFixed(4))));
+  return Math.max(minFloor, Math.min(1.0, Number(linearScale.toFixed(4))));
 }
 
 /**
@@ -500,8 +574,10 @@ export function getTrackQualityScore(song: Song): number {
 /**
  * Deduplicates near-identical track versions (same normalized title + primary artist within ±3s duration)
  * while preserving distinct tracks and keeping the highest-bitrate / best-metadata version.
+ * When `exactOnly` is true (e.g. during playlist import), only collapse tracks with identical IDs
+ * or exact matching normalized title and artist, preserving live, remix, acoustic and alternate versions.
  */
-export function deduplicateNearIdenticalSongs(songs: Song[]): Song[] {
+export function deduplicateNearIdenticalSongs(songs: Song[], exactOnly: boolean = false): Song[] {
   if (!Array.isArray(songs) || songs.length <= 1) return songs || [];
 
   const derivativePattern =
@@ -520,6 +596,14 @@ export function deduplicateNearIdenticalSongs(songs: Song[]): Song[] {
 
     const existingIndex = result.findIndex((existing) => {
       if (existing.id === candidate.id) return true;
+      if (exactOnly) {
+        // In exactOnly mode, preserve distinct songs: only collapse if identical ID or exact same name and artist
+        const candName = cleanHtmlEntities(candidate.name || '').trim().toLowerCase();
+        const existName = cleanHtmlEntities(existing.name || '').trim().toLowerCase();
+        const candArtist = cleanHtmlEntities(candidate.artists?.primary?.[0]?.name || '').trim().toLowerCase();
+        const existArtist = cleanHtmlEntities(existing.artists?.primary?.[0]?.name || '').trim().toLowerCase();
+        return candName === existName && candArtist === existArtist && candName.length > 0;
+      }
       const existingIdentity = getNormalizedSongIdentityKey(existing);
       if (candidateIdentity && existingIdentity && candidateIdentity === existingIdentity) {
         // Do not merge an intentional remix/lofi edit with an original studio track

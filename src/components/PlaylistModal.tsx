@@ -85,6 +85,40 @@ export const PlaylistModal: React.FC<PlaylistModalProps> = ({
     playlistId: string;
     result: ImportPlaylistResult;
   } | null>(null);
+  const [isRetryingFailed, setIsRetryingFailed] = useState(false);
+
+  const handleRetryFailedTracks = async () => {
+    if (!importSuccess || !importSuccess.result.failedTracks || importSuccess.result.failedTracks.length === 0) return;
+    setIsRetryingFailed(true);
+    try {
+      const failedRaw = importSuccess.result.failedTracks.map((t) => `${t.title} - ${t.artist}`).join('\n');
+      const retryResult = await musicAPI.importPlaylistFromLink({ rawText: failedRaw });
+      if (retryResult.songs.length > 0) {
+        for (const song of retryResult.songs) {
+          await addSongToPlaylist(importSuccess.playlistId, song);
+        }
+        setImportSuccess((prev) => {
+          if (!prev) return prev;
+          const remainingFailed = prev.result.failedTracks?.filter(
+            (f) => !retryResult.songs.some((s) => s.name.toLowerCase().includes(f.title.toLowerCase()))
+          );
+          return {
+            ...prev,
+            result: {
+              ...prev.result,
+              matchedCount: prev.result.matchedCount + retryResult.songs.length,
+              unmatchedCount: Math.max(0, remainingFailed?.length || 0),
+              failedTracks: remainingFailed && remainingFailed.length > 0 ? remainingFailed : undefined,
+            },
+          };
+        });
+      }
+    } catch (err: unknown) {
+      console.warn('[Tunely] Retry failed tracks error:', err);
+    } finally {
+      setIsRetryingFailed(false);
+    }
+  };
 
   useEffect(() => {
     if (isOpen) {
@@ -394,6 +428,23 @@ export const PlaylistModal: React.FC<PlaylistModalProps> = ({
                       : ''}{' '}
                     songs to your library &amp; cloud sync.
                   </p>
+                  {importSuccess.result.failedTracks && importSuccess.result.failedTracks.length > 0 && (
+                    <div className="text-[11px] text-amber-500 bg-amber-500/10 border border-amber-500/20 rounded-xl p-2.5 mt-2 text-left space-y-1.5">
+                      <p className="font-semibold">
+                        {importSuccess.result.failedTracks.length} track{importSuccess.result.failedTracks.length > 1 ? 's' : ''} couldn't be resolved:
+                      </p>
+                      <button
+                        type="button"
+                        disabled={isRetryingFailed}
+                        onClick={handleRetryFailedTracks}
+                        className="w-full py-1.5 px-3 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 font-bold text-xs transition cursor-pointer disabled:opacity-50"
+                      >
+                        {isRetryingFailed
+                          ? 'Retrying failed tracks...'
+                          : `Retry ${importSuccess.result.failedTracks.length} Failed Track${importSuccess.result.failedTracks.length > 1 ? 's' : ''}`}
+                      </button>
+                    </div>
+                  )}
                   {importSuccess.result.note && (
                     <p className="text-[11px] text-amber-600 dark:text-amber-300/90 bg-amber-500/10 border border-amber-500/20 rounded-xl p-2 mt-2 text-left leading-relaxed">
                       {importSuccess.result.note}

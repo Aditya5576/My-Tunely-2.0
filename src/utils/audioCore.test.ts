@@ -1621,3 +1621,159 @@ test('47: effective playback reflects both media and context', async () => {
   assert.equal(resolveEffectivePlaybackState(true, 'running'), 'paused');
   for (const state of ['suspended', 'interrupted', 'closed']) assert.equal(resolveEffectivePlaybackState(false, state), 'paused');
 });
+
+test('48: neutral/flat DSP mode produces 1.0 unity gain and linear waveshaper curve', async () => {
+  const { computeHeadroomAttenuation, createLinearWaveShaperCurve, SOUND_PROFILE_PRESETS } = await import('./audioCore');
+  const curve = createLinearWaveShaperCurve(4096);
+  assert.equal(curve.length, 4096);
+  assert.ok(Math.abs(curve[0] - (-1)) < 1e-4, 'Start of linear curve must be -1.0');
+  assert.ok(Math.abs(curve[4095] - 1) < 1e-4, 'End of linear curve must be +1.0');
+  assert.ok(Math.abs(curve[2048] - (2048 * 2 / 4095 - 1)) < 1e-4, 'Midpoint must be linear');
+
+  const flatScale = computeHeadroomAttenuation(SOUND_PROFILE_PRESETS.flat.bands, 1.0);
+  assert.equal(flatScale, 1.0, 'Flat profile must have 1.0 unity gain');
+});
+
+test('49: overlapping EQ + enhancer + stereo width headroom budget attenuates safely', async () => {
+  const { computeHeadroomAttenuation } = await import('./audioCore');
+  // Overlapping low-end bands (sub 6dB + bass 5dB)
+  const overlappingBands = { sub: 6, bass: 5, mid: 0, vocal: 1, air: 2 };
+  const scaleWithOptions = computeHeadroomAttenuation(overlappingBands, 1.25, {
+    enhancerPresenceDb: 0.5,
+    enhancerAirDb: 0.9,
+    stereoWidth: 0.22,
+    minFloor: 0.12,
+  });
+  assert.ok(scaleWithOptions < 0.5, `Scale with overlap and stereo width should be safely attenuated: ${scaleWithOptions}`);
+  assert.ok(scaleWithOptions >= 0.12, 'Must not breach minimum floor of 0.12');
+});
+
+test('50: smooth stall step-down sequence transitions 320 -> 160 -> 96 -> 48 -> 12', () => {
+  const stepDownMap: Record<string, string> = {
+    '320kbps': '160kbps',
+    '160kbps': '96kbps',
+    '96kbps': '48kbps',
+    '48kbps': '12kbps',
+  };
+  assert.equal(stepDownMap['320kbps'], '160kbps', '320kbps must smoothly step down to 160kbps first');
+  assert.equal(stepDownMap['160kbps'], '96kbps', '160kbps must step down to 96kbps');
+  assert.equal(stepDownMap['96kbps'], '48kbps', '96kbps must step down to 48kbps');
+  assert.equal(stepDownMap['48kbps'], '12kbps', '48kbps must step down to 12kbps');
+});
+
+test('51: RFC-4180 CSV-first parser handles quotes, multiline, header mapping and Song - Live precedence', async () => {
+  const { parseRawTrackListDetailed, parseCsvLine } = await import('./playlistText');
+
+  // Test parseCsvLine
+  const csvRow = parseCsvLine('"Hotel California - Live","Eagles","Hotel California"');
+  assert.deepEqual(csvRow, ['Hotel California - Live', 'Eagles', 'Hotel California']);
+
+  const escapedQuotes = parseCsvLine('"Say ""Hello""",Adele');
+  assert.deepEqual(escapedQuotes, ['Say "Hello"', 'Adele']);
+
+  // Test parseRawTrackListDetailed with header and dash-inside-title
+  const sampleCsv = `Track Name,Artist Name(s),Album
+"Hotel California - Live",Eagles,Hell Freezes Over
+"Tum Hi Ho - Acoustic",Arijit Singh,Aashiqui 2
+Shape of You,Ed Sheeran,Divide`;
+
+  const parsed = parseRawTrackListDetailed(sampleCsv);
+  assert.equal(parsed.tracks.length, 3);
+  assert.equal(parsed.tracks[0].title, 'Hotel California - Live');
+  assert.equal(parsed.tracks[0].artist, 'Eagles');
+  assert.equal(parsed.tracks[1].title, 'Tum Hi Ho - Acoustic');
+  assert.equal(parsed.tracks[1].artist, 'Arijit Singh');
+  assert.equal(parsed.tracks[2].title, 'Shape of You');
+  assert.equal(parsed.tracks[2].artist, 'Ed Sheeran');
+});
+
+test('52: track numbering prefixes [1], 1., (1), 1), •, * and 01 - are stripped cleanly', async () => {
+  const { stripTrackNumberPrefix, parseRawTrackList } = await import('./playlistText');
+  assert.equal(stripTrackNumberPrefix('[1] Kesariya - Arijit Singh'), 'Kesariya - Arijit Singh');
+  assert.equal(stripTrackNumberPrefix('1. Kesariya - Arijit Singh'), 'Kesariya - Arijit Singh');
+  assert.equal(stripTrackNumberPrefix('(12) Kesariya - Arijit Singh'), 'Kesariya - Arijit Singh');
+  assert.equal(stripTrackNumberPrefix('3) Kesariya - Arijit Singh'), 'Kesariya - Arijit Singh');
+  assert.equal(stripTrackNumberPrefix('• Kesariya - Arijit Singh'), 'Kesariya - Arijit Singh');
+  assert.equal(stripTrackNumberPrefix('* Kesariya - Arijit Singh'), 'Kesariya - Arijit Singh');
+  assert.equal(stripTrackNumberPrefix('07 - Kesariya - Arijit Singh'), 'Kesariya - Arijit Singh');
+
+  const textList = `[1] Song One - Artist A
+2. Song Two - Artist B
+• Song Three - Artist C`;
+  const tracks = parseRawTrackList(textList);
+  assert.equal(tracks.length, 3);
+  assert.equal(tracks[0].artist, 'Song One'); // dash separator allows reversed
+  assert.equal(tracks[0].title, 'Artist A');
+  assert.equal(tracks[0].allowReversed, true);
+});
+
+test('53: distinct live/remix variants are preserved during playlist import (exactOnly = true)', async () => {
+  const { deduplicateNearIdenticalSongs } = await import('./audioCore');
+  const songOriginal: any = {
+    id: 'orig-1',
+    name: 'Hotel California',
+    duration: 390,
+    artists: { primary: [{ name: 'Eagles' }] },
+    downloadUrl: [{ quality: '320kbps', url: 'https://test/orig.mp3' }],
+  };
+  const songLive: any = {
+    id: 'live-2',
+    name: 'Hotel California (Live)',
+    duration: 392, // within ±3s duration!
+    artists: { primary: [{ name: 'Eagles' }] },
+    downloadUrl: [{ quality: '320kbps', url: 'https://test/live.mp3' }],
+  };
+  const songRemix: any = {
+    id: 'remix-3',
+    name: 'Hotel California - Remix',
+    duration: 389,
+    artists: { primary: [{ name: 'Eagles' }] },
+    downloadUrl: [{ quality: '320kbps', url: 'https://test/remix.mp3' }],
+  };
+
+  // With exactOnly = true (playlist import mode)
+  const importDeduped = deduplicateNearIdenticalSongs([songOriginal, songLive, songRemix], true);
+  assert.equal(importDeduped.length, 3, 'Must preserve distinct live and remix versions during import');
+
+  // Exact duplicate with same name & artist should still collapse
+  const songDuplicate: any = {
+    id: 'orig-dup',
+    name: 'Hotel California',
+    duration: 390,
+    artists: { primary: [{ name: 'Eagles' }] },
+    downloadUrl: [{ quality: '160kbps', url: 'https://test/low.mp3' }],
+  };
+  const collapsed = deduplicateNearIdenticalSongs([songOriginal, songDuplicate], true);
+  assert.equal(collapsed.length, 1, 'Exact duplicate track must collapse');
+  assert.equal(collapsed[0].id, 'orig-1', 'Must retain higher quality version');
+});
+
+test('54: UTF-8 Firestore document byte-budget calculation and 1MB guard', async () => {
+  const { estimateFirestoreDocSize, FIRESTORE_DOC_MAX_BYTES } = await import('../services/firebase');
+  assert.equal(FIRESTORE_DOC_MAX_BYTES, 1000000);
+
+  // Simple string UTF-8 bytes
+  assert.equal(estimateFirestoreDocSize('hello'), 5);
+  // Multi-byte Unicode: "🎵" is 4 bytes in UTF-8
+  assert.equal(estimateFirestoreDocSize('🎵'), 4);
+  // Hindi characters: "गाना" (2 letters + 2 matras = 4 code points, 12 bytes in UTF-8)
+  assert.equal(estimateFirestoreDocSize('गाना'), 12);
+
+  // Realistic mock playlist payload
+  const mockPlaylist = {
+    id: 'pl-123',
+    ownerId: 'user-456',
+    name: 'My Mega Playlist',
+    description: 'A test playlist',
+    songs: Array.from({ length: 100 }, (_, i) => ({
+      id: `song-${i}`,
+      name: `Track Name ${i}`,
+      duration: 240,
+      year: '2024',
+      primaryArtists: 'Artist ' + i,
+    })),
+  };
+  const estimatedSize = estimateFirestoreDocSize(mockPlaylist);
+  assert.ok(estimatedSize > 5000 && estimatedSize < 50000, `Estimated size ${estimatedSize} should be reasonable for 100 songs`);
+  assert.ok(estimatedSize < FIRESTORE_DOC_MAX_BYTES, '100-song playlist must fit comfortably within 1MB limit');
+});

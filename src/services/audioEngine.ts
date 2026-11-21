@@ -18,6 +18,8 @@ import {
   shuffleArray,
   shuffleQueue,
   SOUND_PROFILE_PRESETS,
+  createLinearWaveShaperCurve,
+  createSoftCeilingCurve,
 } from '../utils/audioCore';
 import { localDB } from './db';
 import { musicAPI } from './api';
@@ -32,26 +34,6 @@ const HIRES_DSP_KEY = 'tunely_hires_dsp';
 const IOS_STUDIO_EQ_KEY = 'tunely_ios_studio_eq_v2';
 const OFFLINE_IDS_CACHE_KEY = 'tunely_offline_ids_v1';
 const VOLUME_STORAGE_KEY = 'tunely_volume';
-
-function createSoftCeilingCurve(): Float32Array<ArrayBuffer> {
-  const samples = 4096;
-  const curve = new Float32Array(new ArrayBuffer(samples * 4));
-  const threshold = 0.82;
-  const ceiling = 0.985;
-  const kneeRange = ceiling - threshold;
-  for (let i = 0; i < samples; i++) {
-    const x = (i * 2) / (samples - 1) - 1;
-    const absX = Math.abs(x);
-    if (absX <= threshold) {
-      curve[i] = x;
-    } else {
-      const over = (absX - threshold) / kneeRange;
-      const shaped = threshold + kneeRange * Math.tanh(over);
-      curve[i] = x < 0 ? -shaped : shaped;
-    }
-  }
-  return curve;
-}
 
 interface NetworkConnectionLike {
   effectiveType?: string;
@@ -125,8 +107,9 @@ class AudioEngine {
   // Dual-layer slow-network pre-buffered RAM Blob URLs (LRU capped at 6 tracks)
   private prebufferedTrackCache: Map<string, { blobUrl: string; quality: AudioQuality }> = new Map();
 
-  // Web Audio Clean Hi-Fi Mastering + Unity-Mid Spatial Matrix + Transparent Limiter (ON on iOS & Android)
-  private iosStudioEqEnabled: boolean = true;
+  // Web Audio Clean Hi-Fi Mastering + Unity-Mid Spatial Matrix + Transparent Limiter (default native on iOS)
+  private iosStudioEqEnabled: boolean = false;
+  private hiddenRecoveryAttempts: number = 0;
   private audioCtx: AudioContext | null = null;
   private sourceNode: MediaElementAudioSourceNode | null = null;
   private preGain: GainNode | null = null;
@@ -221,6 +204,8 @@ class AudioEngine {
       const savedIosEqRaw = localStorage.getItem(IOS_STUDIO_EQ_KEY);
       if (savedIosEqRaw === 'true' || savedIosEqRaw === 'false') {
         this.iosStudioEqEnabled = savedIosEqRaw === 'true';
+      } else if (this.isIOS) {
+        this.iosStudioEqEnabled = false;
       }
 
       const savedVolumeRaw = localStorage.getItem(VOLUME_STORAGE_KEY);
@@ -332,7 +317,7 @@ class AudioEngine {
     try {
       let ctx: AudioContext;
       try {
-        ctx = new AudioCtx({ latencyHint: 'playback', sampleRate: 48000 });
+        ctx = new AudioCtx({ latencyHint: 'playback' });
       } catch {
         ctx = new AudioCtx();
       }
@@ -484,23 +469,9 @@ class AudioEngine {
     const effective = computeEffectiveEqBands(this.eqBands, this.bassBoost);
     const now = this.audioCtx.currentTime;
 
-    // Apply negative pre-gain headroom attenuation to prevent EQ boost & makeup clipping
-    const headroomScale = computeHeadroomAttenuation(effective, preset.makeupGain);
-    this.preGain.gain.setTargetAtTime(headroomScale, now, 0.025);
-
     // Gentle Hi-Res upper-mid & sparkle lift balanced against full bass & warm mid body
     const hiResPresenceBonus = this.hiResEnhancer && this.soundProfile !== 'flat' ? 0.5 : 0;
     const hiResAirBonus = this.hiResEnhancer && this.soundProfile !== 'flat' ? 0.9 : 0;
-
-    if (this.hpFilter) {
-      this.hpFilter.frequency.setTargetAtTime(this.hiResEnhancer ? 18 : 10, now, 0.025);
-    }
-
-    this.subShelf.gain.setTargetAtTime(effective.sub, now, 0.025);
-    this.bassPeak.gain.setTargetAtTime(effective.bass, now, 0.025);
-    this.midPeak.gain.setTargetAtTime(effective.mid, now, 0.025);
-    this.vocalPeak.gain.setTargetAtTime(Math.min(9.5, effective.vocal + hiResPresenceBonus), now, 0.025);
-    this.airShelf.gain.setTargetAtTime(Math.min(9.5, effective.air + hiResAirBonus), now, 0.025);
 
     // Zero-loss Mid-Side Spatial Matrix: M=(1+w/2)-(w/2)=1.000 exact center unity
     const width =
@@ -512,6 +483,34 @@ class AudioEngine {
         ? 0.08
         : 0.14;
 
+    // Apply negative pre-gain headroom attenuation taking into account constructive overlap,
+    // makeup gain, stereo width injection, and enhancer gains to guarantee strictly zero clipping.
+    const headroomScale = computeHeadroomAttenuation(effective, preset.makeupGain, {
+      enhancerPresenceDb: hiResPresenceBonus,
+      enhancerAirDb: hiResAirBonus,
+      stereoWidth: width,
+      minFloor: 0.12,
+    });
+    this.preGain.gain.setTargetAtTime(headroomScale, now, 0.025);
+
+    // Switch between 100% bit-transparent linear identity curve in Flat mode and soft-tanh ceiling curve
+    if (this.softCeilingShaper) {
+      this.softCeilingShaper.curve =
+        this.soundProfile === 'flat' || !this.dynamicCompression
+          ? createLinearWaveShaperCurve()
+          : createSoftCeilingCurve();
+    }
+
+    if (this.hpFilter) {
+      this.hpFilter.frequency.setTargetAtTime(this.hiResEnhancer ? 18 : 10, now, 0.025);
+    }
+
+    this.subShelf.gain.setTargetAtTime(effective.sub, now, 0.025);
+    this.bassPeak.gain.setTargetAtTime(effective.bass, now, 0.025);
+    this.midPeak.gain.setTargetAtTime(effective.mid, now, 0.025);
+    this.vocalPeak.gain.setTargetAtTime(Math.min(9.5, effective.vocal + hiResPresenceBonus), now, 0.025);
+    this.airShelf.gain.setTargetAtTime(Math.min(9.5, effective.air + hiResAirBonus), now, 0.025);
+
     if (this.stereoLL && this.stereoLR && this.stereoRL && this.stereoRR) {
       const halfW = width * 0.5;
       this.stereoLL.gain.setTargetAtTime(1 + halfW, now, 0.03);
@@ -520,7 +519,12 @@ class AudioEngine {
       this.stereoRL.gain.setTargetAtTime(-halfW, now, 0.03);
     }
 
-    if (this.dynamicCompression && this.soundProfile !== 'flat') {
+    if (this.soundProfile === 'flat') {
+      this.compressor.threshold.setTargetAtTime(0, now, 0.025);
+      this.compressor.ratio.setTargetAtTime(1, now, 0.025);
+      this.compressor.knee.setTargetAtTime(0, now, 0.025);
+      this.makeupGain.gain.setTargetAtTime(1.0, now, 0.025);
+    } else if (this.dynamicCompression) {
       this.compressor.threshold.setTargetAtTime(preset.compressorThreshold, now, 0.025);
       this.compressor.ratio.setTargetAtTime(preset.compressorRatio, now, 0.025);
       this.compressor.knee.setTargetAtTime(6, now, 0.025);
@@ -529,8 +533,7 @@ class AudioEngine {
       this.compressor.threshold.setTargetAtTime(0, now, 0.025);
       this.compressor.ratio.setTargetAtTime(1, now, 0.025);
       this.compressor.knee.setTargetAtTime(0, now, 0.025);
-      const bypassGain = this.soundProfile === 'flat' ? 1.0 : 1.15;
-      this.makeupGain.gain.setTargetAtTime(bypassGain, now, 0.025);
+      this.makeupGain.gain.setTargetAtTime(1.15, now, 0.025);
     }
   }
 
@@ -854,10 +857,16 @@ class AudioEngine {
       if (resolveEffectivePlaybackState(this.audio.paused, this.audioCtx?.state) === 'playing') {
         this.wasPlayingBeforeInterruption = false;
         this.interruptedAt = 0;
+        this.hiddenRecoveryAttempts = 0;
         this.clearInterruptionWatchdog();
         return;
       }
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        // Retain up to 3 bounded auto-resume attempts when phone call finishes while locked
+        if (this.hiddenRecoveryAttempts < 3 && this.wasPlayingBeforeInterruption) {
+          this.hiddenRecoveryAttempts++;
+          this.attemptAutoResumeStep();
+        }
         return;
       }
       if (this.wasPlayingBeforeInterruption) {
@@ -977,7 +986,7 @@ class AudioEngine {
         }
         this.measuredSlowNetwork = true;
         const stepDownMap: Partial<Record<AudioQuality, AudioQuality>> = {
-          '320kbps': '96kbps',
+          '320kbps': '160kbps',
           '160kbps': '96kbps',
           '96kbps': '48kbps',
           '48kbps': '12kbps',
@@ -1213,8 +1222,11 @@ class AudioEngine {
       this.playState = 'playing';
       this.intendedPlaying = true;
       this.userPaused = false;
-      this.clearAutoResumeTimers();
-      this.clearInterruptionWatchdog();
+      this.hiddenRecoveryAttempts = 0;
+      if (!this.shouldUseWebAudio() || resolveEffectivePlaybackState(this.audio.paused, this.audioCtx?.state) === 'playing') {
+        this.clearAutoResumeTimers();
+        this.clearInterruptionWatchdog();
+      }
       this.clearWaitingTimer();
       this.updateMediaSessionPlaybackState('playing');
       if (changed) this.notify();
@@ -1329,10 +1341,13 @@ class AudioEngine {
       const changed = this.playState !== 'playing';
       this.playState = 'playing';
       this.intendedPlaying = true;
-      this.wasPlayingBeforeInterruption = false;
-      this.interruptedAt = 0;
-      this.clearAutoResumeTimers();
-      this.clearInterruptionWatchdog();
+      this.hiddenRecoveryAttempts = 0;
+      if (!this.shouldUseWebAudio() || resolveEffectivePlaybackState(this.audio.paused, this.audioCtx?.state) === 'playing') {
+        this.wasPlayingBeforeInterruption = false;
+        this.interruptedAt = 0;
+        this.clearAutoResumeTimers();
+        this.clearInterruptionWatchdog();
+      }
       this.clearStallWatchdog();
       this.clearWaitingTimer();
       this.updateMediaSessionPlaybackState('playing');
@@ -1468,18 +1483,24 @@ class AudioEngine {
     try {
       registerMediaSessionActions(navigator.mediaSession, {
         play: () => {
-          this.ensureAudioContextResumed();
+          if (this.audioCtx && shouldAttemptAudioContextResume(this.audioCtx.state)) {
+            this.audioCtx.resume().catch(() => {});
+          }
           this.play();
         },
         pause: () => {
           this.pause();
         },
         previous: () => {
-          this.ensureAudioContextResumed();
+          if (this.audioCtx && shouldAttemptAudioContextResume(this.audioCtx.state)) {
+            this.audioCtx.resume().catch(() => {});
+          }
           this.previous();
         },
         next: () => {
-          this.ensureAudioContextResumed();
+          if (this.audioCtx && shouldAttemptAudioContextResume(this.audioCtx.state)) {
+            this.audioCtx.resume().catch(() => {});
+          }
           this.next();
         },
         seek: (time) => {

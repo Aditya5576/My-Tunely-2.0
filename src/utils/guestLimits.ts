@@ -490,5 +490,12 @@ export function formatFirestoreSyncError(error: unknown): string {
     return 'Cloud sync paused: Firestore quota exceeded.';
   }
 
+  if (
+    code === 'PLAYLIST_SIZE_LIMIT_EXCEEDED' ||
+    /PLAYLIST_SIZE_LIMIT_EXCEEDED|exceeds.*1\s*mb|document.*size|size exceeds/i.test(fullText)
+  ) {
+    return 'Playlist exceeds the cloud storage limit (1 MB). It has been saved locally on this device, but cannot be synced to the cloud.';
+  }
+
   return 'Cloud sync paused. Your local copy is saved.';
 }

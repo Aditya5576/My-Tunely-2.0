@@ -181,6 +181,12 @@ export interface ImportPlaylistInput {
   rawText?: string;
 }
 
+export interface FailedTrackDiagnostic {
+  title: string;
+  artist: string;
+  reason: 'unmatched' | 'network_error' | 'rate_limited';
+}
+
 export interface ImportPlaylistResult {
   platform: string;
   playlistName: string;
@@ -188,6 +194,7 @@ export interface ImportPlaylistResult {
   totalExtracted: number;
   matchedCount: number;
   unmatchedCount: number;
+  failedTracks?: FailedTrackDiagnostic[];
   note?: string;
 }
 
@@ -865,48 +872,107 @@ class JioSaavnMusicService {
     let completed = 0;
     let matchedCount = 0;
     let cursor = 0;
-    const workerCount = Math.min(8, total);
+    // Bounded concurrency (4 workers) prevents triggering 429 rate limits
+    const workerCount = Math.min(4, total);
+    const failedTracks: FailedTrackDiagnostic[] = [];
 
-    const resolveSingleTrack = async (track: { title: string; artist: string }): Promise<Song | null> => {
+    const searchWithRetry = async (
+      query: string,
+      limit: number
+    ): Promise<{ songs: Song[]; error?: 'rate_limited' | 'network_error' }> => {
+      let attempts = 0;
+      while (attempts < 3) {
+        try {
+          const songs = await this.searchSongs(query, limit);
+          return { songs };
+        } catch (err: any) {
+          attempts++;
+          const msg = String(err?.message || '');
+          const is429 = /429|rate\s*limit/i.test(msg);
+          if (attempts >= 3) {
+            return { songs: [], error: is429 ? 'rate_limited' : 'network_error' };
+          }
+          const delay = is429 ? 1000 * Math.pow(2, attempts) : 400 * attempts;
+          await new Promise((r) => setTimeout(r, delay));
+        }
+      }
+      return { songs: [] };
+    };
+
+    const resolveSingleTrack = async (track: {
+      title: string;
+      artist: string;
+    }): Promise<{ song: Song | null; failure?: 'unmatched' | 'network_error' | 'rate_limited' }> => {
       const cleanTitle = cleanHtmlEntities(track.title || '').trim();
       const cleanArtist = cleanHtmlEntities(track.artist || '').trim();
-      if (!cleanTitle && !cleanArtist) return null;
+      if (!cleanTitle && !cleanArtist) return { song: null, failure: 'unmatched' };
 
       const primaryQuery = cleanTitle && cleanArtist ? `${cleanTitle} ${cleanArtist}` : cleanTitle || cleanArtist;
-      try {
-        let candidates = await this.searchSongs(primaryQuery, 8);
-        if (candidates.length === 0 && cleanTitle && cleanArtist) {
-          candidates = await this.searchSongs(`${cleanArtist} ${cleanTitle}`, 8);
-        }
-        if (candidates.length === 0 && cleanTitle) {
-          candidates = await this.searchSongs(cleanTitle, 8);
-        }
-        if (candidates.length === 0 && cleanArtist) {
-          candidates = await this.searchSongs(cleanArtist, 8);
-        }
-        return candidates[0] || null;
-      } catch {
-        return null;
+      let lastError: 'rate_limited' | 'network_error' | undefined;
+
+      const res1 = await searchWithRetry(primaryQuery, 8);
+      if (res1.error) lastError = res1.error;
+      if (res1.songs.length > 0) return { song: res1.songs[0] };
+
+      if (cleanTitle && cleanArtist) {
+        const res2 = await searchWithRetry(`${cleanArtist} ${cleanTitle}`, 8);
+        if (res2.error) lastError = res2.error;
+        if (res2.songs.length > 0) return { song: res2.songs[0] };
       }
+
+      if (cleanTitle) {
+        const res3 = await searchWithRetry(cleanTitle, 8);
+        if (res3.error) lastError = res3.error;
+        if (res3.songs.length > 0) return { song: res3.songs[0] };
+      }
+
+      return { song: null, failure: lastError || 'unmatched' };
     };
 
     const runWorker = async () => {
       while (cursor < total) {
         const idx = cursor++;
-        const match = input.rawText
-          ? await resolveTextPlaylistTrack(rawTracks[idx], (query) => this.searchSongs(query, 15))
-          : await resolveSingleTrack(rawTracks[idx]);
+        const targetTrack = rawTracks[idx];
+        let match: Song | null = null;
+        let failureReason: 'unmatched' | 'network_error' | 'rate_limited' = 'unmatched';
+
+        if (input.rawText) {
+          try {
+            match = await resolveTextPlaylistTrack(targetTrack, async (query) => {
+              const res = await searchWithRetry(query, 15);
+              if (res.error) failureReason = res.error;
+              return res.songs;
+            });
+          } catch {
+            failureReason = 'network_error';
+          }
+        } else {
+          const res = await resolveSingleTrack(targetTrack);
+          match = res.song;
+          if (res.failure) failureReason = res.failure;
+        }
+
         orderedResults[idx] = match;
         completed++;
-        if (match) matchedCount++;
+        if (match) {
+          matchedCount++;
+        } else {
+          failedTracks.push({
+            title: targetTrack.title || 'Unknown Title',
+            artist: targetTrack.artist || 'Unknown Artist',
+            reason: failureReason,
+          });
+        }
         onProgress?.(completed, total, matchedCount);
       }
     };
 
     await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
 
+    // Use exactOnly = true to preserve distinct live/remix variants in imported playlists
     const dedupedSongs = this.deduplicateSongs(
-      orderedResults.filter((s): s is Song => Boolean(s && s.id))
+      orderedResults.filter((s): s is Song => Boolean(s && s.id)),
+      true
     ).slice(0, 450);
 
     return {
@@ -916,6 +982,7 @@ class JioSaavnMusicService {
       totalExtracted: total,
       matchedCount: dedupedSongs.length,
       unmatchedCount: Math.max(0, total - dedupedSongs.length),
+      failedTracks: failedTracks.length > 0 ? failedTracks : undefined,
       note: data.note,
     };
   }
@@ -1287,8 +1354,8 @@ class JioSaavnMusicService {
     };
   }
 
-  private deduplicateSongs(songs: Song[]): Song[] {
-    return deduplicateNearIdenticalSongs(songs);
+  private deduplicateSongs(songs: Song[], exactOnly: boolean = false): Song[] {
+    return deduplicateNearIdenticalSongs(songs, exactOnly);
   }
 }
 

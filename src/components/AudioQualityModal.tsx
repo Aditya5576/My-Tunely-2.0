@@ -150,7 +150,7 @@ export const AudioQualityModal: React.FC<AudioQualityModalProps> = ({ isOpen, on
                 Studio Sound Engine
               </h3>
               <p className="text-[11px] sm:text-xs text-[var(--text-secondary)] truncate">
-                48kHz Hi-Res DSP · Mid-Side Stereo · Soft Clip Guard
+                Hi-Fi Audio Engine · Bit-Perfect Neutral · Soft Clip Guard
               </p>
             </div>
           </div>
@@ -374,8 +374,8 @@ export const AudioQualityModal: React.FC<AudioQualityModalProps> = ({ isOpen, on
                     </p>
                     <p className="text-[11px] text-[var(--text-secondary)] truncate mt-0.5">
                       {iosStudioEqEnabled
-                        ? 'Clean Hi-Fi Mastering active at full loudness'
-                        : 'Native pass-through active (tap to restore Studio EQ)'}
+                        ? 'Clean Hi-Fi DSP active at full dynamic loudness'
+                        : 'Native iOS playback active (best battery & Lock Screen)'}
                     </p>
                   </div>
                 </div>
